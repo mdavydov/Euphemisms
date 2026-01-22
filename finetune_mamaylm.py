@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Finetune MamayLM model using half of the data and optionally evaluate it.
+Finetune MamayLM model using data from all sheets and optionally evaluate it.
 
 This script:
-1. Loads data from PETs_Ukr.xlsx with training phrases containing words in angular brackets
-2. Splits data 50/50 for train/test (like train_and_evaluate_per_sheet.py)
-3. Finetunes MamayLM using LoRA/PEFT
-4. Saves the finetuned model
-5. Optionally evaluates the finetuned model on the test set
+1. Loads data from all sheets of PETs_Ukr.xlsx with training phrases containing words in angular brackets
+2. Splits each sheet's data 50/50 for train/test
+3. Combines all training data and all test data from all sheets
+4. Finetunes MamayLM using LoRA/PEFT
+5. Saves the finetuned model
+6. Optionally evaluates the finetuned model on the test set
 
 Usage:
     python finetune_mamaylm.py              # Just finetune
@@ -63,37 +64,82 @@ def format_prompt(text: str, label: int = None) -> str:
 
 
 def load_and_split_data(xlsx_path: str = "PETs_Ukr.xlsx"):
-    """Load data directly from PETs_Ukr.xlsx and split 50/50 for train/test.
+    """Load data from all sheets of PETs_Ukr.xlsx and split each sheet 50/50 for train/test.
     
     The training phrases contain the word/phrase in angular brackets (e.g., <word>)
     as specified in the 'text' column of PETs_Ukr.xlsx.
     """
-    print(f"Loading data from {xlsx_path}...")
-    df = pd.read_excel(xlsx_path)
-    print(f"Loaded {len(df)} examples")
+    print(f"Loading data from all sheets in {xlsx_path}...")
     
-    # Get text (with angular brackets) and labels
-    texts = df['text'].values
-    labels = df['label'].values
-    categories = df['category'].values  # Store categories for tracking
+    # Load all sheets
+    xl = pd.ExcelFile(xlsx_path)
+    sheet_names = xl.sheet_names
+    print(f"Found {len(sheet_names)} sheets: {sheet_names}")
     
-    print(f"Label distribution:\n{pd.Series(labels).value_counts()}")
-    print(f"Categories: {pd.Series(categories).unique()}")
+    # Lists to collect all training and test data
+    all_train_texts = []
+    all_train_labels = []
+    all_test_texts = []
+    all_test_labels = []
+    all_test_categories = []
     
-    # Split data: 50% for training, 50% for testing
-    print("\nSplitting data (50% train, 50% test)...")
-    train_texts, test_texts, train_labels, test_labels, train_idx, test_idx = train_test_split(
-        texts, labels, np.arange(len(texts)), 
-        test_size=0.5, random_state=42, stratify=labels
-    )
+    # Process each sheet separately
+    for sheet_name in sheet_names:
+        print(f"\nProcessing sheet: {sheet_name}")
+        df = pd.read_excel(xlsx_path, sheet_name=sheet_name)
+        print(f"  Loaded {len(df)} examples from '{sheet_name}'")
+        
+        # Get text (with angular brackets) and labels
+        texts = df['text'].values
+        labels = df['label'].values
+        categories = df['category'].values  # Store categories for tracking
+        
+        print(f"  Label distribution: {dict(pd.Series(labels).value_counts())}")
+        
+        # Split data: 50% for training, 50% for testing
+        # Use stratify to maintain label balance in both sets
+        try:
+            train_texts, test_texts, train_labels, test_labels, train_idx, test_idx = train_test_split(
+                texts, labels, np.arange(len(texts)), 
+                test_size=0.5, random_state=42, stratify=labels
+            )
+        except ValueError:
+            # If stratification fails (e.g., only one class), split without stratification
+            print(f"  Warning: Cannot stratify sheet '{sheet_name}', using simple split")
+            train_texts, test_texts, train_labels, test_labels, train_idx, test_idx = train_test_split(
+                texts, labels, np.arange(len(texts)), 
+                test_size=0.5, random_state=42
+            )
+        
+        test_categories = categories[test_idx]
+        
+        print(f"  Training: {len(train_texts)} examples, Test: {len(test_texts)} examples")
+        
+        # Add to combined lists
+        all_train_texts.extend(train_texts)
+        all_train_labels.extend(train_labels)
+        all_test_texts.extend(test_texts)
+        all_test_labels.extend(test_labels)
+        all_test_categories.extend(test_categories)
     
-    print(f"Training set: {len(train_texts)} examples")
-    print(f"Test set: {len(test_texts)} examples")
+    # Convert to numpy arrays
+    all_train_texts = np.array(all_train_texts)
+    all_train_labels = np.array(all_train_labels)
+    all_test_texts = np.array(all_test_texts)
+    all_test_labels = np.array(all_test_labels)
+    all_test_categories = np.array(all_test_categories)
     
-    # Get categories for test set (for statistics)
-    test_categories = categories[test_idx]
+    print("\n" + "="*80)
+    print("COMBINED DATASET STATISTICS")
+    print("="*80)
+    print(f"Total training examples: {len(all_train_texts)}")
+    print(f"Total test examples: {len(all_test_texts)}")
+    print(f"Training label distribution: {dict(pd.Series(all_train_labels).value_counts())}")
+    print(f"Test label distribution: {dict(pd.Series(all_test_labels).value_counts())}")
+    print(f"Test categories: {sorted(np.unique(all_test_categories))}")
+    print("="*80)
     
-    return train_texts, train_labels, test_texts, test_labels, test_categories
+    return all_train_texts, all_train_labels, all_test_texts, all_test_labels, all_test_categories
 
 
 def prepare_dataset(texts, labels, tokenizer):
