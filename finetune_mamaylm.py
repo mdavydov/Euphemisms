@@ -216,21 +216,32 @@ def setup_lora(model):
     """Set up LoRA configuration for efficient finetuning."""
     print("Setting up LoRA...")
     
-    # Prepare model for k-bit training with gradient checkpointing
-    from peft import prepare_model_for_kbit_training
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    # Enable gradient checkpointing first
+    model.gradient_checkpointing_enable()
     
+    # Prepare model for k-bit training
+    from peft import prepare_model_for_kbit_training
+    model = prepare_model_for_kbit_training(model)
+    
+    # For Gemma3, target all attention projection layers and MLP layers
     lora_config = LoraConfig(
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_dropout=LORA_DROPOUT,
         bias="none",
-        task_type=TaskType.CAUSAL_LM
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
     )
     
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+    
+    # Verify trainable parameters exist
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable parameters: {trainable_params:,}")
+    if trainable_params == 0:
+        raise ValueError("No trainable parameters found after applying LoRA!")
     
     return model
 
