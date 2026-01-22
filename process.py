@@ -5,8 +5,8 @@ Main processing script for euphemism analysis.
 Usage examples:
     python process.py -model openai -m 10 -n 100 PETs_Ukr.xlsx
     python process.py -model deepseek -m 5 -n 50 PETs_Ukr.xlsx
-    python process.py -model gemini -qpm 10 PETs_Ukr.xlsx
-    python process.py -model openai -qpm 60 -m 5 -n 50 PETs_Ukr.xlsx
+    python process.py -model gemini -stat PETs_Ukr.xlsx
+    python process.py -model mamaylm -m 5 -n 50 PETs_Ukr.xlsx
     python process.py -stat PETs_Ukr.xlsx
     python process.py -verify PETs_Ukr.xlsx
 """
@@ -31,8 +31,7 @@ def parse_arguments():
 Examples:
   %(prog)s -model openai -m 10 -n 100 PETs_Ukr.xlsx
   %(prog)s -model deepseek -m 5 -n 50 PETs_Ukr.xlsx
-  %(prog)s -model gemini -qpm 10 PETs_Ukr.xlsx
-  %(prog)s -model openai -qpm 60 -m 5 -n 50 PETs_Ukr.xlsx
+  %(prog)s -model gemini PETs_Ukr.xlsx
   %(prog)s -stat PETs_Ukr.xlsx
   %(prog)s -verify PETs_Ukr.xlsx
         """
@@ -58,6 +57,13 @@ Examples:
     )
     
     parser.add_argument(
+        '-b', '--batch-size',
+        type=int,
+        default=10,
+        help='Batch size for processing (default: 10, lower for less memory usage)'
+    )
+    
+    parser.add_argument(
         '-model', '--model',
         choices=list(SUPPORTED_MODELS.keys()),
         help=f'Model provider to use: {list(SUPPORTED_MODELS.keys())}'
@@ -71,7 +77,7 @@ Examples:
     
     parser.add_argument(
         '--specific-model',
-        help='Specific model name to use (e.g., gpt-4, deepseek-chat, gemini-1.5-pro, gemini-3-pro-preview)'
+        help='Specific model name to use (e.g., gpt-4, deepseek-chat, gemini-1.5-pro)'
     )
     
     parser.add_argument(
@@ -95,12 +101,6 @@ Examples:
         '-verify', '--verify',
         action='store_true',
         help='Verify file consistency: check label column (0/1) and text format (one <group> per text)'
-    )
-    
-    parser.add_argument(
-        '-qpm', '--queries-per-minute',
-        type=int,
-        help='Maximum number of API queries per minute (rate limiting)'
     )
     
     return parser.parse_args()
@@ -186,7 +186,7 @@ def main():
         
         # Create data processor in test mode (no LLM client needed)
         processor = DataProcessor(args.input_file, llm_client=None, test_mode=True)
-        processor.set_limits(args.max_total_rows, args.max_rows_per_sheet)
+        processor.set_limits(args.max_total_rows, args.max_rows_per_sheet, args.batch_size)
         
         # Process the file in test mode
         processor.process_file()
@@ -199,15 +199,11 @@ def main():
     try:
         # Get API key and create LLM client
         api_key = get_api_key(args.model)
-        llm_client = create_llm_client(args.model, api_key, args.specific_model, args.queries_per_minute)
-        
-        # Display rate limit info if set
-        if args.queries_per_minute:
-            print(f"Rate limit: {args.queries_per_minute} queries per minute")
+        llm_client = create_llm_client(args.model, api_key, args.specific_model)
         
         # Create data processor
         processor = DataProcessor(args.input_file, llm_client)
-        processor.set_limits(args.max_total_rows, args.max_rows_per_sheet)
+        processor.set_limits(args.max_total_rows, args.max_rows_per_sheet, args.batch_size)
         
         # Process the file
         processed_sheets, sheet_metrics = processor.process_file()

@@ -154,6 +154,70 @@ class GeminiClient(LLMClient):
             return "0 Error"
 
 
+
+class MamayLMClient(LLMClient):
+    """MamayLM local inference client using Hugging Face transformers."""
+    
+    def __init__(self, model_name: str = "INSAIT-Institute/MamayLM-Gemma-3-12B-IT-v1.0"):
+        super().__init__(model_name, api_key=None)
+        try:
+            from transformers import AutoTokenizer, AutoModelForCausalLM
+            import torch
+        except ImportError:
+            raise ImportError(
+                "MamayLM requires transformers and torch. "
+                "Please install them with: uv pip install transformers torch"
+            )
+        
+        print(f"Loading MamayLM model: {model_name}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="cuda:0",
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+        )
+        print("MamayLM model loaded successfully!")
+        self.rate_limit_delay = 0  # No rate limit for local inference
+
+    def process_text(self, text: str) -> str:
+        """Process text using local MamayLM model."""
+        try:
+            import torch
+            
+            # Format the prompt with system prompt
+            prompt = f"{SYSTEM_PROMPT}\n\nUser: {text}"
+            print(prompt)
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+            
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=10,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            
+            result = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Remove the prompt from the result
+            result = result[len(prompt):].strip()
+            
+            # Clean up GPU memory
+            del inputs
+            del outputs
+            torch.cuda.empty_cache()
+            
+            print(f"MamayLM result: {result[:100]}...")
+            return result
+            
+        except Exception as e:
+            print(f"MamayLM inference error: {e}")
+            # Try to clean up on error too
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return "0 Error"
+
 def create_llm_client(provider: str, api_key: str, model: Optional[str] = None, queries_per_minute: Optional[int] = None) -> LLMClient:
     """
     Factory function to create the appropriate LLM client.
@@ -179,6 +243,8 @@ def create_llm_client(provider: str, api_key: str, model: Optional[str] = None, 
         return OpenAIClient(api_key, model_name, queries_per_minute)
     elif provider == 'gemini':
         return GeminiClient(api_key, model_name, queries_per_minute)
+    elif provider == 'mamaylm':
+        return MamayLMClient(model_name)
     else:
         raise ValueError(f"Provider {provider} not implemented")
 
@@ -187,6 +253,10 @@ def get_api_key(provider: str) -> str:
     """Get API key from environment variables."""
     if provider not in SUPPORTED_MODELS:
         raise ValueError(f"Unsupported provider: {provider}")
+    
+    # MamayLM is local, doesn't need an API key
+    if provider == 'mamaylm':
+        return None
     
     env_var = SUPPORTED_MODELS[provider]['api_key_env']
     api_key = os.getenv(env_var)

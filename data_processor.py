@@ -86,11 +86,13 @@ class DataProcessor:
         self.processed_rows = 0
         self.total_rows_limit = None
         self.max_rows_per_sheet = None
+        self.batch_size = 10  # Default batch size
     
-    def set_limits(self, max_total_rows: int, max_rows_per_sheet: int):
+    def set_limits(self, max_total_rows: int, max_rows_per_sheet: int, batch_size: int = 10):
         """Set processing limits."""
         self.total_rows_limit = max_total_rows
         self.max_rows_per_sheet = max_rows_per_sheet
+        self.batch_size = batch_size
     
     def process_sheet(self, df: pd.DataFrame, sheet_name: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """
@@ -135,7 +137,7 @@ class DataProcessor:
         labels = np.array(process_df['label'], dtype=np.int8) if 'label' in process_df.columns else None
         
         # Process with LLM in batches or show prompts in test mode
-        batch_size = 10  # From notebook analysis
+        batch_size = self.batch_size
         ai_labels = []
         ai_replies = []
         
