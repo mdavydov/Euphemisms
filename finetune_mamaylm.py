@@ -193,20 +193,32 @@ def prepare_dataset(texts, labels, tokenizer):
 
 
 def load_base_model(model_name: str):
-    """Load the base MamayLM model."""
+    """Load the base MamayLM model with 8-bit quantization."""
     print(f"Loading base model: {model_name}...")
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",  # Better device allocation
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        max_memory={0: "22GB"},  # Limit GPU memory usage
-    )
+    # Try to use 8-bit quantization if available, otherwise load in bfloat16
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            load_in_8bit=True,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+        )
+        print("Model loaded with 8-bit quantization")
+    except Exception as e:
+        print(f"8-bit quantization not available ({e}), loading in bfloat16...")
+        # Load without max_memory to avoid offloading to meta device
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="cuda:0",  # Force to single GPU
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+        )
     
     print("Base model loaded successfully!")
     return tokenizer, model
