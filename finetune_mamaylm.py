@@ -273,9 +273,9 @@ def finetune_model(train_texts, train_labels, output_dir: str = OUTPUT_DIR):
         optim="adamw_torch",
         remove_unused_columns=False,
         report_to="none",
-        gradient_checkpointing=True,  # Enable gradient checkpointing
-        max_grad_norm=1.0,  # Gradient clipping for stability
-        dataloader_pin_memory=False,  # Reduce CPU memory usage
+        gradient_checkpointing=False,  # Disable to avoid conflicts with PEFT
+        max_grad_norm=1.0,
+        dataloader_pin_memory=False,
     )
     
     # Data collator
