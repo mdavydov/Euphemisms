@@ -92,7 +92,11 @@ def load_and_split_data(xlsx_path: str = "PETs_Ukr.xlsx"):
         # Get text (with angular brackets) and labels
         texts = df['text'].values
         labels = df['label'].values
-        categories = df['category'].values  # Store categories for tracking
+        # Use sheet name as category (some sheets don't have 'category' column)
+        if 'category' in df.columns:
+            categories = df['category'].values
+        else:
+            categories = np.array([sheet_name] * len(df))
         
         print(f"  Label distribution: {dict(pd.Series(labels).value_counts())}")
         
