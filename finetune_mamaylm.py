@@ -216,9 +216,9 @@ def setup_lora(model):
     """Set up LoRA configuration for efficient finetuning."""
     print("Setting up LoRA...")
     
-    # Prepare model for k-bit training if using device_map
+    # Prepare model for k-bit training with gradient checkpointing
     from peft import prepare_model_for_kbit_training
-    model = prepare_model_for_kbit_training(model)
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
     
     lora_config = LoraConfig(
         r=LORA_RANK,
@@ -243,9 +243,6 @@ def finetune_model(train_texts, train_labels, output_dir: str = OUTPUT_DIR):
     
     # Load model and tokenizer
     tokenizer, model = load_base_model(MODEL_NAME)
-    
-    # Disable cache for gradient checkpointing compatibility
-    model.config.use_cache = False
     
     # Apply LoRA
     model = setup_lora(model)
