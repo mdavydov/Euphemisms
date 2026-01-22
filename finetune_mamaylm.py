@@ -216,9 +216,6 @@ def setup_lora(model):
     """Set up LoRA configuration for efficient finetuning."""
     print("Setting up LoRA...")
     
-    # Enable gradient checkpointing first
-    model.gradient_checkpointing_enable()
-    
     # Prepare model for k-bit training
     from peft import prepare_model_for_kbit_training
     model = prepare_model_for_kbit_training(model)
