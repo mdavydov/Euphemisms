@@ -4,16 +4,17 @@ Finetune MamayLM model using data from all sheets and optionally evaluate it.
 
 This script:
 1. Loads data from all sheets of PETs_Ukr.xlsx with training phrases containing words in angular brackets
-2. Splits each sheet's data 50/50 for train/test
-3. Combines all training data and all test data from all sheets
-4. Finetunes MamayLM using LoRA/PEFT
+2. Splits each sheet's data 50/25/25 for train/validation/test
+3. Combines all training, validation, and test data from all sheets
+4. Finetunes MamayLM using LoRA/PEFT with validation tracking
 5. Saves the finetuned model
 6. Optionally evaluates the finetuned model on the test set
 
 Usage:
-    python finetune_mamaylm.py              # Just finetune
-    python finetune_mamaylm.py --evaluate   # Finetune and evaluate
-    python finetune_mamaylm.py --eval-only  # Only evaluate existing model
+    python finetune_mamaylm.py                          # Just finetune
+    python finetune_mamaylm.py --evaluate               # Finetune and evaluate
+    python finetune_mamaylm.py --eval-only              # Only evaluate existing model
+    python finetune_mamaylm.py --evaluate --show-all-queries  # Show all query results
 """
 
 import argparse
@@ -64,7 +65,7 @@ def format_prompt(text: str, label: int = None) -> str:
 
 
 def load_and_split_data(xlsx_path: str = "PETs_Ukr.xlsx"):
-    """Load data from all sheets of PETs_Ukr.xlsx and split each sheet 50/50 for train/test.
+    """Load data from all sheets of PETs_Ukr.xlsx and split each sheet 50/25/25 for train/val/test.
     
     The training phrases contain the word/phrase in angular brackets (e.g., <word>)
     as specified in the 'text' column of PETs_Ukr.xlsx.
@@ -76,9 +77,11 @@ def load_and_split_data(xlsx_path: str = "PETs_Ukr.xlsx"):
     sheet_names = xl.sheet_names
     print(f"Found {len(sheet_names)} sheets: {sheet_names}")
     
-    # Lists to collect all training and test data
+    # Lists to collect all training, validation, and test data
     all_train_texts = []
     all_train_labels = []
+    all_val_texts = []
+    all_val_labels = []
     all_test_texts = []
     all_test_labels = []
     all_test_categories = []
@@ -100,28 +103,40 @@ def load_and_split_data(xlsx_path: str = "PETs_Ukr.xlsx"):
         
         print(f"  Label distribution: {dict(pd.Series(labels).value_counts())}")
         
-        # Split data: 50% for training, 50% for testing
-        # Use stratify to maintain label balance in both sets
+        # Split data: 50% for training, 25% for validation, 25% for testing
+        # Use stratify to maintain label balance in all sets
         try:
-            train_texts, test_texts, train_labels, test_labels, train_idx, test_idx = train_test_split(
+            # First split: 50% train, 50% temp (which will be split into val and test)
+            train_texts, temp_texts, train_labels, temp_labels, train_idx, temp_idx = train_test_split(
                 texts, labels, np.arange(len(texts)), 
                 test_size=0.5, random_state=42, stratify=labels
+            )
+            # Second split: split temp into 50% val and 50% test (25% and 25% of original)
+            val_texts, test_texts, val_labels, test_labels, val_idx, test_idx = train_test_split(
+                temp_texts, temp_labels, temp_idx,
+                test_size=0.5, random_state=42, stratify=temp_labels
             )
         except ValueError:
             # If stratification fails (e.g., only one class), split without stratification
             print(f"  Warning: Cannot stratify sheet '{sheet_name}', using simple split")
-            train_texts, test_texts, train_labels, test_labels, train_idx, test_idx = train_test_split(
+            train_texts, temp_texts, train_labels, temp_labels, train_idx, temp_idx = train_test_split(
                 texts, labels, np.arange(len(texts)), 
+                test_size=0.5, random_state=42
+            )
+            val_texts, test_texts, val_labels, test_labels, val_idx, test_idx = train_test_split(
+                temp_texts, temp_labels, temp_idx,
                 test_size=0.5, random_state=42
             )
         
         test_categories = categories[test_idx]
         
-        print(f"  Training: {len(train_texts)} examples, Test: {len(test_texts)} examples")
+        print(f"  Training: {len(train_texts)} examples, Validation: {len(val_texts)} examples, Test: {len(test_texts)} examples")
         
         # Add to combined lists
         all_train_texts.extend(train_texts)
         all_train_labels.extend(train_labels)
+        all_val_texts.extend(val_texts)
+        all_val_labels.extend(val_labels)
         all_test_texts.extend(test_texts)
         all_test_labels.extend(test_labels)
         all_test_categories.extend(test_categories)
@@ -129,6 +144,8 @@ def load_and_split_data(xlsx_path: str = "PETs_Ukr.xlsx"):
     # Convert to numpy arrays
     all_train_texts = np.array(all_train_texts)
     all_train_labels = np.array(all_train_labels)
+    all_val_texts = np.array(all_val_texts)
+    all_val_labels = np.array(all_val_labels)
     all_test_texts = np.array(all_test_texts)
     all_test_labels = np.array(all_test_labels)
     all_test_categories = np.array(all_test_categories)
@@ -137,13 +154,15 @@ def load_and_split_data(xlsx_path: str = "PETs_Ukr.xlsx"):
     print("COMBINED DATASET STATISTICS")
     print("="*80)
     print(f"Total training examples: {len(all_train_texts)}")
+    print(f"Total validation examples: {len(all_val_texts)}")
     print(f"Total test examples: {len(all_test_texts)}")
     print(f"Training label distribution: {dict(pd.Series(all_train_labels).value_counts())}")
+    print(f"Validation label distribution: {dict(pd.Series(all_val_labels).value_counts())}")
     print(f"Test label distribution: {dict(pd.Series(all_test_labels).value_counts())}")
     print(f"Test categories: {sorted(np.unique(all_test_categories))}")
     print("="*80)
     
-    return all_train_texts, all_train_labels, all_test_texts, all_test_labels, all_test_categories
+    return all_train_texts, all_train_labels, all_val_texts, all_val_labels, all_test_texts, all_test_labels, all_test_categories
 
 
 def prepare_dataset(texts, labels, tokenizer):
@@ -255,8 +274,8 @@ def setup_lora(model):
     return model
 
 
-def finetune_model(train_texts, train_labels, output_dir: str = OUTPUT_DIR):
-    """Finetune MamayLM using LoRA."""
+def finetune_model(train_texts, train_labels, val_texts, val_labels, output_dir: str = OUTPUT_DIR):
+    """Finetune MamayLM using LoRA with validation."""
     print("\n" + "="*80)
     print("STARTING FINETUNING")
     print("="*80)
@@ -267,20 +286,26 @@ def finetune_model(train_texts, train_labels, output_dir: str = OUTPUT_DIR):
     # Apply LoRA
     model = setup_lora(model)
     
-    # Prepare dataset
+    # Prepare datasets
     train_dataset = prepare_dataset(train_texts, train_labels, tokenizer)
+    val_dataset = prepare_dataset(val_texts, val_labels, tokenizer)
     
-    # Training arguments with memory optimization
+    # Training arguments with memory optimization and validation
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=NUM_EPOCHS,
         per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
         learning_rate=LEARNING_RATE,
         warmup_steps=WARMUP_STEPS,
         logging_steps=10,
+        eval_strategy="steps",
+        eval_steps=100,
         save_steps=100,
         save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
         bf16=True,
         optim="adamw_torch",
         remove_unused_columns=False,
@@ -301,6 +326,7 @@ def finetune_model(train_texts, train_labels, output_dir: str = OUTPUT_DIR):
         model=model,
         args=training_args,
         train_dataset=train_dataset,
+        eval_dataset=val_dataset,
         data_collator=data_collator,
     )
     
@@ -317,6 +343,7 @@ def finetune_model(train_texts, train_labels, output_dir: str = OUTPUT_DIR):
     del trainer
     del model
     del train_dataset
+    del val_dataset
     torch.cuda.empty_cache()
     gc.collect()
     
@@ -377,7 +404,7 @@ def predict_single(text: str, tokenizer, model) -> int:
     return 0  # Default to 0 if no clear label
 
 
-def evaluate_model(test_texts, test_labels, test_categories, model_path: str = OUTPUT_DIR):
+def evaluate_model(test_texts, test_labels, test_categories, model_path: str = OUTPUT_DIR, show_all_queries: bool = False):
     """Evaluate the finetuned model on test set."""
     print("\n" + "="*80)
     print("EVALUATING FINETUNED MODEL")
@@ -397,6 +424,11 @@ def evaluate_model(test_texts, test_labels, test_categories, model_path: str = O
         
         pred = predict_single(text, tokenizer, model)
         predictions.append(pred)
+        
+        # Show query results if requested
+        if show_all_queries:
+            correct = "✓" if pred == test_labels[i] else "✗"
+            print(f"  [{i+1}] {correct} Text: {text[:80]}... | Predicted: {pred} | Actual: {test_labels[i]}")
         
         # Aggressive memory cleanup (more frequent)
         if (i + 1) % 5 == 0:
@@ -521,21 +553,26 @@ def main():
         default='PETs_Ukr.xlsx',
         help='Path to data file (default: PETs_Ukr.xlsx)'
     )
+    parser.add_argument(
+        '--show-all-queries',
+        action='store_true',
+        help='Show all query results during evaluation'
+    )
     
     args = parser.parse_args()
     
     # Load and split data
-    train_texts, train_labels, test_texts, test_labels, test_categories = load_and_split_data(args.data_path)
+    train_texts, train_labels, val_texts, val_labels, test_texts, test_labels, test_categories = load_and_split_data(args.data_path)
     
     # Finetune model (unless eval-only)
     if not args.eval_only:
-        finetune_model(train_texts, train_labels, args.model_path)
+        finetune_model(train_texts, train_labels, val_texts, val_labels, args.model_path)
     else:
         print("Skipping finetuning (--eval-only mode)")
     
     # Evaluate model if requested or if eval-only
     if args.evaluate or args.eval_only:
-        evaluate_model(test_texts, test_labels, test_categories, args.model_path)
+        evaluate_model(test_texts, test_labels, test_categories, args.model_path, args.show_all_queries)
     else:
         print("\nSkipping evaluation. Use --evaluate flag to evaluate the model.")
         print(f"To evaluate later, run: python {__file__} --eval-only")
