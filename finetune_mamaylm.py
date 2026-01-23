@@ -15,6 +15,7 @@ Usage:
     python finetune_mamaylm.py --evaluate               # Finetune and evaluate
     python finetune_mamaylm.py --eval-only              # Only evaluate existing model
     python finetune_mamaylm.py --evaluate --show-all-queries  # Show all query results
+    python finetune_mamaylm.py --predict "Text with <word>" --model-path ./path  # Predict single phrase
 """
 
 import argparse
@@ -558,8 +559,41 @@ def main():
         action='store_true',
         help='Show all query results during evaluation'
     )
+    parser.add_argument(
+        '--predict',
+        type=str,
+        default=None,
+        help='Predict classification for a single phrase (e.g., "Text with <word> in brackets")'
+    )
     
     args = parser.parse_args()
+    
+    # Single phrase prediction mode
+    if args.predict:
+        print("\n" + "="*80)
+        print("SINGLE PHRASE PREDICTION")
+        print("="*80)
+        print(f"Text: {args.predict}")
+        print(f"Model: {args.model_path}")
+        print()
+        
+        # Load finetuned model
+        tokenizer, model = load_finetuned_model(args.model_path)
+        model.eval()
+        
+        # Make prediction
+        prediction = predict_single(args.predict, tokenizer, model)
+        
+        print("\n" + "="*80)
+        print(f"Prediction: {prediction}")
+        print(f"Classification: {'Euphemism (1)' if prediction == 1 else 'Not euphemism (0)'}")
+        print("="*80)
+        
+        # Clean up
+        del model, tokenizer
+        torch.cuda.empty_cache()
+        print("\nDone!")
+        return
     
     # Load and split data
     train_texts, train_labels, val_texts, val_labels, test_texts, test_labels, test_categories = load_and_split_data(args.data_path)
