@@ -184,3 +184,173 @@ The code is organized into modules for easy maintenance:
 - Modify processing logic in `DataProcessor` class
 - Update vocabulary and prompts in `config.py`
 - Add new statistics in `statistics.py`
+## MamayLM Finetuning
+
+The `finetune_mamaylm.py` script allows you to finetune the MamayLM model on euphemism detection data and evaluate its performance.
+
+### Features
+
+- **Multi-Sheet Processing**: Loads data from all sheets in `PETs_Ukr.xlsx`
+- **Reproducible Splits**: 50% train / 50% test split per sheet with fixed random seed (`random_state=42`)
+- **LoRA/PEFT**: Efficient finetuning using Low-Rank Adaptation
+- **Memory Optimized**: Supports 8-bit quantization to fit large models
+- **Per-Category Evaluation**: Detailed statistics for each euphemism category
+
+### Usage
+
+#### Training Only
+```bash
+python finetune_mamaylm.py
+```
+
+#### Training + Evaluation
+```bash
+python finetune_mamaylm.py --evaluate
+```
+
+#### Evaluation Only (using existing model)
+```bash
+python finetune_mamaylm.py --eval-only
+```
+
+#### Custom Model Path
+```bash
+python finetune_mamaylm.py --eval-only --model-path /path/to/model
+```
+
+### Command Line Options
+
+- `--evaluate`: Evaluate the model after finetuning
+- `--eval-only`: Skip training and only evaluate existing model
+- `--model-path PATH`: Path to finetuned model (default: `./mamaylm_finetuned`)
+- `--data-path PATH`: Path to data file (default: `PETs_Ukr.xlsx`)
+
+### Output
+
+The script produces:
+- **Finetuned model**: Saved to `./mamaylm_finetuned/` directory
+- **Evaluation results**: Printed to console with overall and per-category metrics
+- **Statistics CSV**: `mamaylm_finetuned_statistics.csv` with detailed per-category performance
+
+### Data Split
+
+The data split is **fully reproducible** across different computers:
+- Uses `random_state=42` for consistent train/test splits
+- Processes sheets in deterministic order from Excel file
+- Each sheet is split 50/50 independently, then combined
+
+**Total Dataset**:
+- Training: 1,311 examples (50% from each sheet)
+- Test: 1,311 examples (50% from each sheet)
+- 11 categories: age, appearance, bad habits, bodily functions, corruption, death, impairments, lovesex, lying, money, war
+
+### Using Finetuned Weights on Another Computer
+
+#### What Gets Saved
+
+When training completes, the `./mamaylm_finetuned/` directory contains:
+- **LoRA adapter weights** (only the small adapter layers, not the full model)
+- **Tokenizer files** for text processing
+- **Training configuration** (model config and adapter config)
+
+#### Transfer Steps
+
+**1. Package the weights** (on training computer):
+```bash
+tar -czf mamaylm_finetuned.tar.gz mamaylm_finetuned/
+```
+
+**2. Transfer to evaluation computer**:
+```bash
+# Via scp
+scp mamaylm_finetuned.tar.gz user@eval-computer:/path/to/destination/
+
+# Or use rsync, cloud storage, USB drive, etc.
+```
+
+**3. Extract on evaluation computer**:
+```bash
+tar -xzf mamaylm_finetuned.tar.gz
+```
+
+**4. Copy data file**:
+```bash
+# Make sure PETs_Ukr.xlsx is in the same location
+cp PETs_Ukr.xlsx /path/to/evaluation/directory/
+```
+
+**5. Install dependencies** (on evaluation computer):
+```bash
+pip install transformers peft torch pandas openpyxl scikit-learn
+# Optional: bitsandbytes for 8-bit quantization
+pip install bitsandbytes
+```
+
+**6. Run evaluation**:
+```bash
+python finetune_mamaylm.py --eval-only --model-path ./mamaylm_finetuned
+```
+
+#### How It Works
+
+The evaluation process:
+1. Downloads the base model from HuggingFace: `INSAIT-Institute/MamayLM-Gemma-3-12B-IT-v1.0` (~24GB, one-time download)
+2. Applies the LoRA adapters from `./mamaylm_finetuned/`
+3. Merges weights for inference
+4. Uses the **exact same test split** due to fixed random seed
+
+#### Important Notes
+
+- ✓ **Small transfer size**: Only LoRA adapters need transfer (~few MB to few hundred MB)
+- ✓ **Reproducible evaluation**: Same test split on any computer with `random_state=42`
+- ✓ **Internet required**: Base model downloads from HuggingFace (one-time)
+- ✓ **Identical data**: `PETs_Ukr.xlsx` must be the same file on both computers
+
+### Configuration
+
+Edit the following constants in `finetune_mamaylm.py` to customize training:
+
+```python
+MODEL_NAME = "INSAIT-Institute/MamayLM-Gemma-3-12B-IT-v1.0"
+OUTPUT_DIR = "./mamaylm_finetuned"
+LORA_RANK = 8
+LORA_ALPHA = 16
+LORA_DROPOUT = 0.1
+MAX_LENGTH = 512
+BATCH_SIZE = 1
+GRADIENT_ACCUMULATION_STEPS = 8
+LEARNING_RATE = 2e-4
+NUM_EPOCHS = 3
+WARMUP_STEPS = 100
+```
+
+### Requirements
+
+- Python 3.8+
+- CUDA-capable GPU (recommended: 24GB+ VRAM)
+- Dependencies:
+  - `transformers`
+  - `peft`
+  - `torch`
+  - `pandas`
+  - `openpyxl`
+  - `scikit-learn`
+  - `bitsandbytes` (optional, for quantization)
+
+### Troubleshooting
+
+**Out of Memory Error**:
+- The script tries to use 8-bit quantization automatically
+- Reduce `BATCH_SIZE` or `MAX_LENGTH` in the script
+- Ensure `bitsandbytes` is installed: `pip install bitsandbytes`
+
+**Different Results on Another Computer**:
+- Ensure the same `PETs_Ukr.xlsx` file is used
+- Check that the random seed (`random_state=42`) is not modified
+- Verify sheet order is the same in the Excel file
+
+**Model Download Fails**:
+- Check internet connection
+- Ensure sufficient disk space (~24GB for base model)
+- May need HuggingFace authentication: `huggingface-cli login`
+
