@@ -7,6 +7,7 @@ Usage examples:
     python process.py -model deepseek -m 5 -n 50 PETs_Ukr.xlsx
     python process.py -model gemini -stat PETs_Ukr.xlsx
     python process.py -model mamaylm -m 5 -n 50 PETs_Ukr.xlsx
+    python process.py -model lapa -m 5 -n 50 PETs_Ukr.xlsx
     python process.py -stat PETs_Ukr.xlsx
     python process.py -verify PETs_Ukr.xlsx
 """

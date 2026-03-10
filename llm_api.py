@@ -218,6 +218,56 @@ class MamayLMClient(LLMClient):
                 torch.cuda.empty_cache()
             return "0 Error"
 
+
+class LapaClient(LLMClient):
+    """Lapa local inference client using Hugging Face transformers pipeline."""
+    
+    def __init__(self, model_name: str = "lapa-llm/lapa-v0.1.2-instruct"):
+        super().__init__(model_name, api_key=None)
+        try:
+            from transformers import pipeline
+        except ImportError:
+            raise ImportError(
+                "Lapa requires transformers and torch. "
+                "Please install them with: uv pip install transformers torch"
+            )
+        
+        print(f"Loading Lapa model: {model_name}...")
+        self.pipe = pipeline("image-text-to-text", model=model_name)
+        print("Lapa model loaded successfully!")
+        self.rate_limit_delay = 0  # No rate limit for local inference
+
+    def process_text(self, text: str) -> str:
+        """Process text using local Lapa model via pipeline."""
+        try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": SYSTEM_PROMPT}]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": text}]
+                },
+            ]
+            output = self.pipe(text=messages, max_new_tokens=20)
+            # Extract generated text from pipeline output
+            if isinstance(output, list) and len(output) > 0:
+                result = output[0].get("generated_text", "")
+                if isinstance(result, list):
+                    # Get the last message (assistant response)
+                    result = result[-1].get("content", "") if result else ""
+            else:
+                result = str(output)
+            
+            result = str(result).strip()
+            print(f"Lapa result: {result[:100]}...")
+            return result
+            
+        except Exception as e:
+            print(f"Lapa inference error: {e}")
+            return "0 Error"
+
 def create_llm_client(provider: str, api_key: str, model: Optional[str] = None, queries_per_minute: Optional[int] = None) -> LLMClient:
     """
     Factory function to create the appropriate LLM client.
@@ -243,6 +293,8 @@ def create_llm_client(provider: str, api_key: str, model: Optional[str] = None, 
         return OpenAIClient(api_key, model_name, queries_per_minute)
     elif provider == 'gemini':
         return GeminiClient(api_key, model_name, queries_per_minute)
+    elif provider == 'lapa':
+        return LapaClient(model_name)
     elif provider == 'mamaylm':
         return MamayLMClient(model_name)
     else:
@@ -254,8 +306,8 @@ def get_api_key(provider: str) -> str:
     if provider not in SUPPORTED_MODELS:
         raise ValueError(f"Unsupported provider: {provider}")
     
-    # MamayLM is local, doesn't need an API key
-    if provider == 'mamaylm':
+    # Local models don't need an API key
+    if provider in ('mamaylm', 'lapa'):
         return None
     
     env_var = SUPPORTED_MODELS[provider]['api_key_env']
