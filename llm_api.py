@@ -156,13 +156,12 @@ class GeminiClient(LLMClient):
 
 
 class MamayLMClient(LLMClient):
-    """MamayLM local inference client using Hugging Face transformers."""
+    """MamayLM local inference client using Hugging Face transformers pipeline."""
     
     def __init__(self, model_name: str = "INSAIT-Institute/MamayLM-Gemma-3-12B-IT-v1.0"):
         super().__init__(model_name, api_key=None)
         try:
-            from transformers import AutoTokenizer, AutoModelForCausalLM
-            import torch
+            from transformers import pipeline
         except ImportError:
             raise ImportError(
                 "MamayLM requires transformers and torch. "
@@ -170,52 +169,39 @@ class MamayLMClient(LLMClient):
             )
         
         print(f"Loading MamayLM model: {model_name}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="cuda:0",
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-        )
+        self.pipe = pipeline("image-text-to-text", model=model_name)
         print("MamayLM model loaded successfully!")
         self.rate_limit_delay = 0  # No rate limit for local inference
 
     def process_text(self, text: str) -> str:
-        """Process text using local MamayLM model."""
+        """Process text using local MamayLM model via pipeline."""
         try:
-            import torch
+            messages = [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": SYSTEM_PROMPT}]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": text}]
+                },
+            ]
+            output = self.pipe(text=messages, max_new_tokens=20)
+            # Extract generated text from pipeline output
+            if isinstance(output, list) and len(output) > 0:
+                result = output[0].get("generated_text", "")
+                if isinstance(result, list):
+                    # Get the last message (assistant response)
+                    result = result[-1].get("content", "") if result else ""
+            else:
+                result = str(output)
             
-            # Format the prompt with system prompt
-            prompt = f"{SYSTEM_PROMPT}\n\nUser: {text}"
-            print(prompt)
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-            
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=10,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.eos_token_id
-                )
-            
-            result = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            # Remove the prompt from the result
-            result = result[len(prompt):].strip()
-            
-            # Clean up GPU memory
-            del inputs
-            del outputs
-            torch.cuda.empty_cache()
-            
+            result = str(result).strip()
             print(f"MamayLM result: {result[:100]}...")
             return result
             
         except Exception as e:
             print(f"MamayLM inference error: {e}")
-            # Try to clean up on error too
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
             return "0 Error"
 
 
@@ -268,6 +254,49 @@ class LapaClient(LLMClient):
             print(f"Lapa inference error: {e}")
             return "0 Error"
 
+
+class QwenClient(LLMClient):
+    """Qwen2.5 local inference client using Hugging Face transformers pipeline."""
+    
+    def __init__(self, model_name: str = "Qwen/Qwen2.5-14B-Instruct"):
+        super().__init__(model_name, api_key=None)
+        try:
+            from transformers import pipeline
+        except ImportError:
+            raise ImportError(
+                "Qwen requires transformers and torch. "
+                "Please install them with: uv pip install transformers torch"
+            )
+        
+        print(f"Loading Qwen model: {model_name}...")
+        self.pipe = pipeline("text-generation", model=model_name)
+        print("Qwen model loaded successfully!")
+        self.rate_limit_delay = 0  # No rate limit for local inference
+
+    def process_text(self, text: str) -> str:
+        """Process text using local Qwen model via pipeline."""
+        try:
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ]
+            output = self.pipe(messages, max_new_tokens=20)
+            # Extract generated text from pipeline output
+            if isinstance(output, list) and len(output) > 0:
+                result = output[0].get("generated_text", "")
+                if isinstance(result, list):
+                    # Get the last message (assistant response)
+                    result = result[-1].get("content", "") if result else ""
+            else:
+                result = str(output)
+            
+            result = str(result).strip()
+            print(f"Qwen result: {result[:100]}...")
+            return result
+            
+        except Exception as e:
+            print(f"Qwen inference error: {e}")
+            return "0 Error"
 def create_llm_client(provider: str, api_key: str, model: Optional[str] = None, queries_per_minute: Optional[int] = None) -> LLMClient:
     """
     Factory function to create the appropriate LLM client.
@@ -297,6 +326,8 @@ def create_llm_client(provider: str, api_key: str, model: Optional[str] = None, 
         return LapaClient(model_name)
     elif provider == 'mamaylm':
         return MamayLMClient(model_name)
+    elif provider == 'qwen':
+        return QwenClient(model_name)
     else:
         raise ValueError(f"Provider {provider} not implemented")
 
@@ -307,7 +338,7 @@ def get_api_key(provider: str) -> str:
         raise ValueError(f"Unsupported provider: {provider}")
     
     # Local models don't need an API key
-    if provider in ('mamaylm', 'lapa'):
+    if provider in ('mamaylm', 'lapa', 'qwen'):
         return None
     
     env_var = SUPPORTED_MODELS[provider]['api_key_env']
