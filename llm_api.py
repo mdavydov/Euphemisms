@@ -170,6 +170,8 @@ class MamayLMClient(LLMClient):
         
         print(f"Loading MamayLM model: {model_name}...")
         self.pipe = pipeline("image-text-to-text", model=model_name)
+        if self.pipe.tokenizer.pad_token_id is None:
+            self.pipe.tokenizer.pad_token_id = self.pipe.tokenizer.eos_token_id
         print("MamayLM model loaded successfully!")
         self.rate_limit_delay = 0  # No rate limit for local inference
 
@@ -204,6 +206,77 @@ class MamayLMClient(LLMClient):
             print(f"MamayLM inference error: {e}")
             return "0 Error"
 
+    def process_batch(self, texts: List[str], max_workers: int = 10) -> List[str]:
+        """Process multiple texts using batched model.generate() for GPU efficiency."""
+        import torch
+
+        conversations = [
+            [
+                {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+                {"role": "user", "content": [{"type": "text", "text": text}]},
+            ]
+            for text in texts
+        ]
+
+        tokenizer = self.pipe.tokenizer
+        model = self.pipe.model
+
+        orig_padding_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+
+        try:
+            input_ids_list = []
+            for conv in conversations:
+                ids = tokenizer.apply_chat_template(
+                    conv, return_tensors="pt", add_generation_prompt=True
+                ).squeeze(0)
+                input_ids_list.append(ids)
+
+            max_len = max(ids.size(0) for ids in input_ids_list)
+            pad_id = tokenizer.pad_token_id
+
+            padded_ids = []
+            attention_masks = []
+            for ids in input_ids_list:
+                pad_len = max_len - ids.size(0)
+                padded = torch.cat([
+                    torch.full((pad_len,), pad_id, dtype=ids.dtype),
+                    ids
+                ])
+                mask = torch.cat([
+                    torch.zeros(pad_len, dtype=torch.long),
+                    torch.ones(ids.size(0), dtype=torch.long)
+                ])
+                padded_ids.append(padded)
+                attention_masks.append(mask)
+
+            batch_ids = torch.stack(padded_ids).to(model.device)
+            batch_mask = torch.stack(attention_masks).to(model.device)
+
+            results = []
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids=batch_ids,
+                    attention_mask=batch_mask,
+                    max_new_tokens=20,
+                )
+
+            for i, output_ids in enumerate(outputs):
+                new_tokens = output_ids[max_len:]
+                result = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+                print(f"MamayLM result: {result[:100]}...")
+                results.append(result)
+
+        except Exception as e:
+            print(f"MamayLM batch error, falling back to sequential: {e}")
+            results = []
+            for text in texts:
+                results.append(self.process_text(text))
+        finally:
+            tokenizer.padding_side = orig_padding_side
+
+        return results
+
 
 class LapaClient(LLMClient):
     """Lapa local inference client using Hugging Face transformers pipeline."""
@@ -220,6 +293,8 @@ class LapaClient(LLMClient):
         
         print(f"Loading Lapa model: {model_name}...")
         self.pipe = pipeline("image-text-to-text", model=model_name)
+        if self.pipe.tokenizer.pad_token_id is None:
+            self.pipe.tokenizer.pad_token_id = self.pipe.tokenizer.eos_token_id
         print("Lapa model loaded successfully!")
         self.rate_limit_delay = 0  # No rate limit for local inference
 
@@ -254,6 +329,77 @@ class LapaClient(LLMClient):
             print(f"Lapa inference error: {e}")
             return "0 Error"
 
+    def process_batch(self, texts: List[str], max_workers: int = 10) -> List[str]:
+        """Process multiple texts using batched model.generate() for GPU efficiency."""
+        import torch
+
+        conversations = [
+            [
+                {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+                {"role": "user", "content": [{"type": "text", "text": text}]},
+            ]
+            for text in texts
+        ]
+
+        tokenizer = self.pipe.tokenizer
+        model = self.pipe.model
+
+        orig_padding_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+
+        try:
+            input_ids_list = []
+            for conv in conversations:
+                ids = tokenizer.apply_chat_template(
+                    conv, return_tensors="pt", add_generation_prompt=True
+                ).squeeze(0)
+                input_ids_list.append(ids)
+
+            max_len = max(ids.size(0) for ids in input_ids_list)
+            pad_id = tokenizer.pad_token_id
+
+            padded_ids = []
+            attention_masks = []
+            for ids in input_ids_list:
+                pad_len = max_len - ids.size(0)
+                padded = torch.cat([
+                    torch.full((pad_len,), pad_id, dtype=ids.dtype),
+                    ids
+                ])
+                mask = torch.cat([
+                    torch.zeros(pad_len, dtype=torch.long),
+                    torch.ones(ids.size(0), dtype=torch.long)
+                ])
+                padded_ids.append(padded)
+                attention_masks.append(mask)
+
+            batch_ids = torch.stack(padded_ids).to(model.device)
+            batch_mask = torch.stack(attention_masks).to(model.device)
+
+            results = []
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids=batch_ids,
+                    attention_mask=batch_mask,
+                    max_new_tokens=20,
+                )
+
+            for i, output_ids in enumerate(outputs):
+                new_tokens = output_ids[max_len:]
+                result = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+                print(f"Lapa result: {result[:100]}...")
+                results.append(result)
+
+        except Exception as e:
+            print(f"Lapa batch error, falling back to sequential: {e}")
+            results = []
+            for text in texts:
+                results.append(self.process_text(text))
+        finally:
+            tokenizer.padding_side = orig_padding_side
+
+        return results
+
 
 class QwenClient(LLMClient):
     """Qwen2.5 local inference client using Hugging Face transformers pipeline."""
@@ -270,6 +416,8 @@ class QwenClient(LLMClient):
         
         print(f"Loading Qwen model: {model_name}...")
         self.pipe = pipeline("text-generation", model=model_name)
+        if self.pipe.tokenizer.pad_token_id is None:
+            self.pipe.tokenizer.pad_token_id = self.pipe.tokenizer.eos_token_id
         print("Qwen model loaded successfully!")
         self.rate_limit_delay = 0  # No rate limit for local inference
 
@@ -297,6 +445,41 @@ class QwenClient(LLMClient):
         except Exception as e:
             print(f"Qwen inference error: {e}")
             return "0 Error"
+
+    def process_batch(self, texts: List[str], max_workers: int = 10) -> List[str]:
+        """Process multiple texts using pipeline dataset batching for GPU efficiency."""
+        conversations = [
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ]
+            for text in texts
+        ]
+
+        results = []
+        try:
+            # Use generator to trigger pipeline's efficient PipelineIterator batching
+            for output in self.pipe(
+                (conv for conv in conversations),
+                max_new_tokens=20,
+                batch_size=len(conversations),
+            ):
+                if isinstance(output, list) and len(output) > 0:
+                    result = output[0].get("generated_text", "")
+                    if isinstance(result, list):
+                        result = result[-1].get("content", "") if result else ""
+                else:
+                    result = str(output)
+                result = str(result).strip()
+                print(f"Qwen result: {result[:100]}...")
+                results.append(result)
+        except Exception as e:
+            print(f"Qwen batch error, falling back to sequential: {e}")
+            results = []
+            for text in texts:
+                results.append(self.process_text(text))
+
+        return results
 def create_llm_client(provider: str, api_key: str, model: Optional[str] = None, queries_per_minute: Optional[int] = None) -> LLMClient:
     """
     Factory function to create the appropriate LLM client.

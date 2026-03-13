@@ -550,7 +550,7 @@ class DataProcessor:
             f.write(total_line)
 
 
-def generate_output_filename(model_provider: str, model_name: str, method: str, experiment_num: int = 1) -> str:
+def generate_output_filename(model_provider: str, model_name: str, method: str, experiment_num: int = 1, label: str = None) -> str:
     """
     Generate output filename according to the required format.
     
@@ -566,10 +566,11 @@ def generate_output_filename(model_provider: str, model_name: str, method: str, 
     # Create a short model identifier
     model_id = f"{model_provider}-{model_name.replace('/', '-').replace('.', '-')}"
     
-    return f"Result-{model_id}-{method}-experiment{experiment_num}.xlsx"
+    prefix = f"Result-{label}-" if label else "Result-"
+    return f"{prefix}{model_id}-{method}-experiment{experiment_num}.xlsx"
 
 
-def find_next_experiment_number(model_provider: str, model_name: str, method: str) -> int:
+def find_next_experiment_number(model_provider: str, model_name: str, method: str, label: str = None) -> int:
     """
     Find the next available experiment number.
     
@@ -583,7 +584,7 @@ def find_next_experiment_number(model_provider: str, model_name: str, method: st
     """
     experiment_num = 1
     while True:
-        filename = generate_output_filename(model_provider, model_name, method, experiment_num)
+        filename = generate_output_filename(model_provider, model_name, method, experiment_num, label)
         if not os.path.exists(filename):
             return experiment_num
         experiment_num += 1

@@ -87,6 +87,11 @@ Examples:
     )
     
     parser.add_argument(
+        '-label', '--label',
+        help='Label to prepend to output filename (e.g., -label prompt2 produces Result-prompt2-...)'
+    )
+    
+    parser.add_argument(
         '--verbose',
         action='store_true',
         help='Enable verbose output'
@@ -215,8 +220,8 @@ def main():
         else:
             method = get_processing_method(args.max_rows_per_sheet, args.max_total_rows)
             model_name = args.specific_model or SUPPORTED_MODELS[args.model]['default_model']
-            experiment_num = find_next_experiment_number(args.model, model_name, method)
-            output_file = generate_output_filename(args.model, model_name, method, experiment_num)
+            experiment_num = find_next_experiment_number(args.model, model_name, method, args.label)
+            output_file = generate_output_filename(args.model, model_name, method, experiment_num, args.label)
         
         # Save results
         processor.save_results(processed_sheets, output_file, sheet_metrics)
