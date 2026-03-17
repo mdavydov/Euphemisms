@@ -2,10 +2,15 @@
 """
 Run MamayLM with custom queries using base or finetuned model.
 
+Inference is done in 2 explicit steps:
+  Step 1: Convert prompt text into embeddings
+  Step 2: Generate output tokens from embeddings
+
 Usage:
     python run_query.py "Your query here"                    # Use base model
-    python run_query.py "Your query" --model-path ./path     # Use finetuned model
+    python run_query.py "Your query" --model-path ./path     # Use finetuned model (LoRA)
     python run_query.py "Text: <word> phrase" --classify     # Classification format
+    python run_query.py "Text: <word> phrase" --classify --prompt-embeds ./mamaylm_prompt_tuned/prompt_embeddings.pt
 """
 
 import argparse
@@ -21,7 +26,7 @@ DEFAULT_OUTPUT_DIR = "./mamaylm_finetuned"
 
 
 def format_prompt(text: str, use_system_prompt: bool = False) -> str:
-    """Format the prompt for inference."""
+    """Format the prompt for inference (includes system prompt)."""
     if use_system_prompt:
         user_prompt = f"Text: {text}"
         return f"{SYSTEM_PROMPT}\n\nUser: {user_prompt}\nAssistant:"
@@ -29,21 +34,120 @@ def format_prompt(text: str, use_system_prompt: bool = False) -> str:
         return text
 
 
+def format_prompt_no_system(text: str) -> str:
+    """Format the prompt without system prompt (for prompt-tuning inference).
+
+    When using learned prompt embeddings, the system prompt is replaced
+    by the embeddings, so the text should not include it.
+    """
+    user_prompt = f"Text: {text}"
+    return f"\n\nUser: {user_prompt}\nAssistant:"
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Convert prompt into embeddings
+# ---------------------------------------------------------------------------
+def prompt_to_embeddings(
+    query: str,
+    tokenizer,
+    model,
+    prompt_embeddings: torch.Tensor = None,
+):
+    """Step 1 – Convert prompt text into embeddings.
+
+    If *prompt_embeddings* is provided (learned system-prompt embeddings),
+    they are prepended to the token embeddings of *query*.
+
+    Returns:
+        input_embeds  – (1, seq_len, embed_dim)
+        attention_mask – (1, seq_len)
+    """
+    inputs = tokenizer(query, return_tensors="pt").to(model.device)
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+
+    # Convert token IDs → dense embeddings via the model's embedding layer
+    embed_layer = model.get_input_embeddings()
+    input_embeds = embed_layer(input_ids)
+
+    if prompt_embeddings is not None:
+        # Prepend the learned prompt embeddings
+        pe = prompt_embeddings.unsqueeze(0).to(
+            dtype=input_embeds.dtype, device=model.device
+        )
+        input_embeds = torch.cat([pe, input_embeds], dim=1)
+        # Extend attention mask for prompt tokens
+        prompt_mask = torch.ones(
+            1, pe.shape[1], device=model.device, dtype=attention_mask.dtype
+        )
+        attention_mask = torch.cat([prompt_mask, attention_mask], dim=1)
+
+    return input_embeds, attention_mask
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Inference using embeddings
+# ---------------------------------------------------------------------------
+def inference_from_embeddings(
+    embeddings: torch.Tensor,
+    attention_mask: torch.Tensor,
+    tokenizer,
+    model,
+    max_new_tokens: int = 10,
+) -> str:
+    """Step 2 – Generate output tokens from pre-computed embeddings.
+
+    Returns:
+        The generated text (prompt tokens stripped).
+    """
+    prompt_length = embeddings.shape[1]
+
+    with torch.no_grad():
+        outputs = model.generate(
+            inputs_embeds=embeddings,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    # Strip prompt positions and decode only the newly generated tokens
+    new_tokens = outputs[0][prompt_length:]
+    response = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Helper: load learned prompt embeddings from a .pt file
+# ---------------------------------------------------------------------------
+def load_prompt_embeddings(path: str) -> torch.Tensor:
+    """Load learned prompt embeddings saved during prompt-tuning."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Prompt embeddings file not found: {p}")
+    prompt_embeds = torch.load(p, map_location="cpu", weights_only=True)
+    print(f"Loaded prompt embeddings: shape {prompt_embeds.shape}")
+    return prompt_embeds
+
+
+# ---------------------------------------------------------------------------
+# Model loading helpers
+# ---------------------------------------------------------------------------
 def load_base_model(model_name: str = BASE_MODEL_NAME):
     """Load the base MamayLM model."""
     print(f"Loading base model: {model_name}...")
-    
+
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map="auto",
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
-    
+
     print("Base model loaded successfully!")
     return tokenizer, model
 
@@ -51,15 +155,15 @@ def load_base_model(model_name: str = BASE_MODEL_NAME):
 def load_finetuned_model(model_path: str):
     """Load the finetuned model with LoRA weights."""
     print(f"Loading finetuned model from {model_path}...")
-    
+
     if not Path(model_path).exists():
         raise FileNotFoundError(f"Model path not found: {model_path}")
-    
+
     # Load tokenizer from finetuned path
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+
     # Load base model
     base_model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_NAME,
@@ -67,31 +171,34 @@ def load_finetuned_model(model_path: str):
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
-    
+
     # Load and merge LoRA weights
     model = PeftModel.from_pretrained(base_model, model_path)
     model = model.merge_and_unload()
-    
+
     print("Finetuned model loaded successfully!")
     return tokenizer, model
 
 
-def run_query(query: str, tokenizer, model, max_new_tokens: int = 10) -> str:
-    """Run a single query through the model."""
-    inputs = tokenizer(query, return_tensors="pt").to(model.device)
-    
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-    
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    # Remove the prompt from the response
-    response = response[len(query):].strip()
-    
+# ---------------------------------------------------------------------------
+# Main inference – uses 2-step process
+# ---------------------------------------------------------------------------
+def run_query(
+    query: str,
+    tokenizer,
+    model,
+    max_new_tokens: int = 10,
+    prompt_embeddings: torch.Tensor = None,
+) -> str:
+    """Run a single query through the model (2-step: embed → generate)."""
+    # Step 1: Convert prompt to embeddings
+    embeddings, attention_mask = prompt_to_embeddings(
+        query, tokenizer, model, prompt_embeddings
+    )
+    # Step 2: Generate from embeddings
+    response = inference_from_embeddings(
+        embeddings, attention_mask, tokenizer, model, max_new_tokens
+    )
     return response
 
 
@@ -127,6 +234,13 @@ def main():
         help='Use classification format with system prompt (for finetuned model)'
     )
     parser.add_argument(
+        '--prompt-embeds',
+        type=str,
+        default=None,
+        help='Path to learned prompt embeddings .pt file (from prompt-tuning). '
+             'Replaces the textual system prompt with learned embeddings.'
+    )
+    parser.add_argument(
         '--max-tokens',
         type=int,
         default=10,
@@ -137,40 +251,53 @@ def main():
         action='store_true',
         help='Run in interactive mode for multiple queries'
     )
-    
+
     args = parser.parse_args()
-    
+
     # Load model
     if args.model_path:
         tokenizer, model = load_finetuned_model(args.model_path)
     else:
         tokenizer, model = load_base_model()
-    
+
     model.eval()
+
+    # Optionally load learned prompt embeddings
+    learned_prompt_embeds = None
+    if args.prompt_embeds:
+        learned_prompt_embeds = load_prompt_embeddings(args.prompt_embeds)
+
     print()
-    
+
     # Interactive mode
     if args.interactive:
         print("Interactive mode. Type 'quit' or 'exit' to stop.")
         print("=" * 80)
-        
+
         while True:
             try:
                 query_input = input("\nQuery: ").strip()
-                
+
                 if query_input.lower() in ['quit', 'exit', 'q']:
                     print("Exiting...")
                     break
-                
+
                 if not query_input:
                     continue
-                
-                # Format query if classification mode
-                query = format_prompt(query_input, args.classify) if args.classify else query_input
-                
-                # Run query
-                response = run_query(query, tokenizer, model, args.max_tokens)
-                
+
+                # Format query
+                if learned_prompt_embeds is not None:
+                    # Prompt-tuning mode: no textual system prompt
+                    query = format_prompt_no_system(query_input) if args.classify else query_input
+                else:
+                    query = format_prompt(query_input, args.classify) if args.classify else query_input
+
+                # Run 2-step inference
+                response = run_query(
+                    query, tokenizer, model, args.max_tokens,
+                    prompt_embeddings=learned_prompt_embeds,
+                )
+
                 # Display results
                 if args.classify:
                     classification = extract_classification(response)
@@ -179,39 +306,45 @@ def main():
                     print(f"Raw response: {response}")
                 else:
                     print(f"Response: {response}")
-                    
+
             except KeyboardInterrupt:
                 print("\n\nExiting...")
                 break
             except Exception as e:
                 print(f"Error: {e}")
-    
+
     # Single query mode
     else:
         if not args.query:
             parser.error("Query text is required in non-interactive mode")
-        
+
         query_input = args.query
-        
-        # Format query if classification mode
-        query = format_prompt(query_input, args.classify) if args.classify else query_input
-        
+
+        # Format query
+        if learned_prompt_embeds is not None:
+            query = format_prompt_no_system(query_input) if args.classify else query_input
+        else:
+            query = format_prompt(query_input, args.classify) if args.classify else query_input
+
         print(f"Query: {query_input}")
         print("=" * 80)
-        
-        # Run query
-        response = run_query(query, tokenizer, model, args.max_tokens)
-        
+
+        # Run 2-step inference
+        response = run_query(
+            query, tokenizer, model, args.max_tokens,
+            prompt_embeddings=learned_prompt_embeds,
+        )
+
         # Display results
         print(f"\nResponse: {response}")
-        
+
         if args.classify:
             classification = extract_classification(response)
             if classification is not None:
                 print(f"Classification: {classification}")
             else:
                 print("Classification: Could not extract (0 or 1)")
-        
+
         print()
 
 
