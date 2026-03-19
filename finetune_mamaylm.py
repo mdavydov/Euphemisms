@@ -218,13 +218,17 @@ def prepare_dataset(texts, labels, tokenizer, include_system_prompt: bool = True
 
         del formatted_batch, tokenized
 
+    # Create token_type_ids (all zeros, required by Gemma3)
+    token_type_ids_list = [[0] * len(ids) for ids in input_ids_list]
+
     # Create dataset
     dataset = Dataset.from_dict({
         'input_ids': input_ids_list,
-        'attention_mask': attention_mask_list
+        'attention_mask': attention_mask_list,
+        'token_type_ids': token_type_ids_list
     })
 
-    del input_ids_list, attention_mask_list
+    del input_ids_list, attention_mask_list, token_type_ids_list
     gc.collect()
 
     print(f"Dataset prepared with {len(dataset)} examples")
@@ -288,6 +292,70 @@ def setup_lora(model):
         raise ValueError("No trainable parameters found after applying LoRA!")
 
     return model
+
+
+def patch_peft_forward_for_gemma3(peft_model, num_virtual_tokens):
+    """Monkey-patch PEFT model forward to pass token_type_ids through for Gemma3.
+
+    PEFT strips token_type_ids but Gemma3 requires them during training.
+    This patch extends token_type_ids with zeros for virtual tokens
+    (analogous to how PEFT extends attention_mask) and passes them through.
+    """
+    import types as _types
+
+    def _patched_forward(self, input_ids=None, attention_mask=None,
+                         inputs_embeds=None, labels=None,
+                         output_attentions=None, output_hidden_states=None,
+                         return_dict=None, task_ids=None, **kwargs):
+        batch_size = (input_ids.shape[0] if input_ids is not None
+                      else inputs_embeds.shape[0])
+
+        # Pop token_type_ids before PEFT can strip it with a warning
+        token_type_ids = kwargs.pop("token_type_ids", None)
+
+        # Get prompt embeddings from PEFT
+        prompts = self.get_prompt(batch_size=batch_size, task_ids=task_ids)
+
+        # Convert input_ids -> inputs_embeds
+        if inputs_embeds is None:
+            inputs_embeds = self.word_embeddings(input_ids)
+
+        # Prepend virtual-token embeddings
+        inputs_embeds = torch.cat(
+            (prompts.to(inputs_embeds.dtype), inputs_embeds), dim=1)
+
+        # Extend attention_mask
+        if attention_mask is not None:
+            prefix_attention_mask = torch.ones(
+                batch_size, num_virtual_tokens,
+                device=attention_mask.device, dtype=attention_mask.dtype)
+            attention_mask = torch.cat(
+                (prefix_attention_mask, attention_mask), dim=1)
+
+        # Extend token_type_ids (required by Gemma3)
+        if token_type_ids is not None:
+            prefix_token_type_ids = torch.zeros(
+                batch_size, num_virtual_tokens,
+                device=token_type_ids.device, dtype=token_type_ids.dtype)
+            kwargs["token_type_ids"] = torch.cat(
+                (prefix_token_type_ids, token_type_ids), dim=1)
+
+        # Extend labels
+        if labels is not None:
+            prefix_labels = torch.full(
+                (batch_size, num_virtual_tokens), -100,
+                device=labels.device, dtype=labels.dtype)
+            labels = torch.cat((prefix_labels, labels), dim=1)
+
+        return self.base_model(
+            inputs_embeds=inputs_embeds, labels=labels,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict, **kwargs)
+
+    peft_model.forward = _types.MethodType(_patched_forward, peft_model)
+    print("Patched PEFT forward to pass token_type_ids for Gemma3.")
 
 
 def setup_prompt_tuning(model, tokenizer):
@@ -363,6 +431,7 @@ def finetune_model(train_texts, train_labels, val_texts, val_labels,
     # Apply the chosen parameter-efficient method
     if prompt_tuning:
         model, num_virtual_tokens = setup_prompt_tuning(model, tokenizer)
+        patch_peft_forward_for_gemma3(model, num_virtual_tokens)
         include_system_prompt = False  # learned embeddings replace system prompt
         lr = PROMPT_TUNING_LEARNING_RATE
     else:
