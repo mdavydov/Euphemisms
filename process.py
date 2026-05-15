@@ -3,11 +3,11 @@
 Main processing script for euphemism analysis.
 
 Usage examples:
-    python process.py -model openai -m 10 -n 100 PETs_Ukr.xlsx
-    python process.py -model deepseek -m 5 -n 50 PETs_Ukr.xlsx
-    python process.py -model gemini -stat PETs_Ukr.xlsx
-    python process.py -model mamaylm -m 5 -n 50 PETs_Ukr.xlsx
-    python process.py -model lapa -m 5 -n 50 PETs_Ukr.xlsx
+    python process.py --provider openai -m 10 -n 100 PETs_Ukr.xlsx
+    python process.py --provider deepseek -m 5 -n 50 PETs_Ukr.xlsx
+    python process.py --provider gemini -stat PETs_Ukr.xlsx
+    python process.py --provider mamaylm -m 5 -n 50 PETs_Ukr.xlsx
+    python process.py --provider lapa -m 5 -n 50 PETs_Ukr.xlsx
     python process.py -stat PETs_Ukr.xlsx
     python process.py -verify PETs_Ukr.xlsx
 """
@@ -17,7 +17,7 @@ import sys
 import os
 from dotenv import load_dotenv
 
-from config import DEFAULT_MAX_ROWS_PER_SHEET, DEFAULT_MAX_TOTAL_ROWS, SUPPORTED_MODELS
+from config import DEFAULT_MAX_ROWS_PER_SHEET, DEFAULT_MAX_TOTAL_ROWS, SUPPORTED_MODELS, SYSTEM_PROMPTS, get_system_prompt
 from statistics import get_file_statistics, print_statistics
 from llm_api import create_llm_client, get_api_key
 from data_processor import DataProcessor, generate_output_filename, find_next_experiment_number, get_processing_method
@@ -30,9 +30,9 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s -model openai -m 10 -n 100 PETs_Ukr.xlsx
-  %(prog)s -model deepseek -m 5 -n 50 PETs_Ukr.xlsx
-  %(prog)s -model gemini PETs_Ukr.xlsx
+  %(prog)s --provider openai -m 10 -n 100 PETs_Ukr.xlsx
+  %(prog)s --provider deepseek -m 5 -n 50 PETs_Ukr.xlsx
+  %(prog)s --provider gemini PETs_Ukr.xlsx
   %(prog)s -stat PETs_Ukr.xlsx
   %(prog)s -verify PETs_Ukr.xlsx
         """
@@ -65,7 +65,7 @@ Examples:
     )
     
     parser.add_argument(
-        '-model', '--model',
+        '--provider',
         choices=list(SUPPORTED_MODELS.keys()),
         help=f'Model provider to use: {list(SUPPORTED_MODELS.keys())}'
     )
@@ -77,7 +77,7 @@ Examples:
     )
     
     parser.add_argument(
-        '--specific-model',
+        '--model',
         help='Specific model name to use (e.g., gpt-4, deepseek-chat, gemini-1.5-pro)'
     )
     
@@ -89,6 +89,14 @@ Examples:
     parser.add_argument(
         '-label', '--label',
         help='Label to prepend to output filename (e.g., -label prompt2 produces Result-prompt2-...)'
+    )
+    
+    parser.add_argument(
+        '-prompt', '--prompt',
+        type=int,
+        default=1,
+        choices=range(1, len(SYSTEM_PROMPTS) + 1),
+        help=f'System prompt number to use (1-{len(SYSTEM_PROMPTS)}, default: 1)'
     )
     
     parser.add_argument(
@@ -120,9 +128,9 @@ def validate_arguments(args):
         sys.exit(1)
     
     # Check if we need model for processing (not just statistics, test, or verify mode)
-    if not args.statistics_only and not args.test_mode and not args.verify and not args.model:
-        print("Error: Model must be specified when not using -stat, -test, or -verify mode")
-        print("Use -model option, -stat for statistics only, -test for test mode, or -verify for file verification")
+    if not args.statistics_only and not args.test_mode and not args.verify and not args.provider:
+        print("Error: Provider must be specified when not using -stat, -test, or -verify mode")
+        print("Use --provider option, -stat for statistics only, -test for test mode, or -verify for file verification")
         sys.exit(1)
     
     # Validate limits
@@ -185,13 +193,17 @@ def main():
         print_statistics(stats)
         return
     
+    # Get the selected system prompt
+    system_prompt = get_system_prompt(args.prompt)
+    print(f"Using prompt {args.prompt}: {system_prompt[:80]}...")
+    
     # Test mode
     if args.test_mode:
         print("Mode: Test mode (showing prompts without LLM calls)")
         print(f"Limits: max_rows_per_sheet={args.max_rows_per_sheet}, max_total_rows={args.max_total_rows}")
         
         # Create data processor in test mode (no LLM client needed)
-        processor = DataProcessor(args.input_file, llm_client=None, test_mode=True)
+        processor = DataProcessor(args.input_file, llm_client=None, test_mode=True, system_prompt=system_prompt)
         processor.set_limits(args.max_total_rows, args.max_rows_per_sheet, args.batch_size)
         
         # Process the file in test mode
@@ -199,16 +211,16 @@ def main():
         return
     
     # Processing mode
-    print(f"Mode: Processing with {args.model}")
+    print(f"Mode: Processing with {args.provider}")
     print(f"Limits: max_rows_per_sheet={args.max_rows_per_sheet}, max_total_rows={args.max_total_rows}")
     
     try:
         # Get API key and create LLM client
-        api_key = get_api_key(args.model)
-        llm_client = create_llm_client(args.model, api_key, args.specific_model)
+        api_key = get_api_key(args.provider)
+        llm_client = create_llm_client(args.provider, api_key, args.model, system_prompt=system_prompt)
         
         # Create data processor
-        processor = DataProcessor(args.input_file, llm_client)
+        processor = DataProcessor(args.input_file, llm_client, system_prompt=system_prompt)
         processor.set_limits(args.max_total_rows, args.max_rows_per_sheet, args.batch_size)
         
         # Process the file
@@ -219,9 +231,9 @@ def main():
             output_file = args.output
         else:
             method = get_processing_method(args.max_rows_per_sheet, args.max_total_rows)
-            model_name = args.specific_model or SUPPORTED_MODELS[args.model]['default_model']
-            experiment_num = find_next_experiment_number(args.model, model_name, method, args.label)
-            output_file = generate_output_filename(args.model, model_name, method, experiment_num, args.label)
+            model_name = args.model or SUPPORTED_MODELS[args.provider]['default_model']
+            experiment_num = find_next_experiment_number(args.provider, model_name, method, args.label, args.prompt)
+            output_file = generate_output_filename(args.provider, model_name, method, experiment_num, args.label, args.prompt)
         
         # Save results
         processor.save_results(processed_sheets, output_file, sheet_metrics)

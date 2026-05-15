@@ -37,7 +37,7 @@ def calculate_metrics(ground_truth: np.ndarray, predictions: np.ndarray) -> Dict
         return {
             'n': 0, 'lp': 0, 'ln': 0, 'pp': 0, 'pn': 0,
             'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0,
-            'precision': 0.0, 'recall': 0.0, 'f1': 0.0
+            'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0
         }
     
     # Ground truth counts
@@ -59,9 +59,12 @@ def calculate_metrics(ground_truth: np.ndarray, predictions: np.ndarray) -> Dict
     recall = tp / lp if lp > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
     
+    accuracy = (tp + tn) / n if n > 0 else 0.0
+    
     return {
         'n': n, 'lp': lp, 'ln': ln, 'pp': pp, 'pn': pn,
         'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn,
+        'accuracy': round(accuracy, 3),
         'precision': round(precision, 3),
         'recall': round(recall, 3),
         'f1': round(f1, 3)
@@ -71,7 +74,7 @@ def calculate_metrics(ground_truth: np.ndarray, predictions: np.ndarray) -> Dict
 class DataProcessor:
     """Handles Excel file processing with LLM integration."""
     
-    def __init__(self, input_file: str, llm_client: Optional[LLMClient] = None, test_mode: bool = False):
+    def __init__(self, input_file: str, llm_client: Optional[LLMClient] = None, test_mode: bool = False, system_prompt: str = None):
         """
         Initialize the data processor.
         
@@ -79,10 +82,12 @@ class DataProcessor:
             input_file: Path to input Excel file
             llm_client: LLM client for processing (None for statistics-only or test mode)
             test_mode: If True, shows prompts without calling LLM APIs
+            system_prompt: System prompt to display in test mode
         """
         self.input_file = input_file
         self.llm_client = llm_client
         self.test_mode = test_mode
+        self.system_prompt = system_prompt or SYSTEM_PROMPT
         self.processed_rows = 0
         self.total_rows_limit = None
         self.max_rows_per_sheet = None
@@ -119,7 +124,7 @@ class DataProcessor:
                 'sheet_name': sheet_name,
                 'n': 0, 'lp': 0, 'ln': 0, 'pp': 0, 'pn': 0,
                 'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0,
-                'precision': 0.0, 'recall': 0.0, 'f1': 0.0
+                'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0
             }
             return df, metrics
         
@@ -149,7 +154,7 @@ class DataProcessor:
                 # Test mode: show prompts instead of calling API
                 for j, text in enumerate(batch_texts):
                     print(f"\n--- Prompt for text {i+j+1} ---")
-                    print(f"SYSTEM PROMPT:\n{SYSTEM_PROMPT}")
+                    print(f"SYSTEM PROMPT:\n{self.system_prompt}")
                     print(f"\nUSER TEXT:\n{text}")
                     print("--- End of Prompt ---\n")
                     
@@ -197,7 +202,7 @@ class DataProcessor:
             metrics.update({
                 'n': rows_to_process, 'lp': 0, 'ln': 0, 'pp': sum(ai_labels), 'pn': rows_to_process - sum(ai_labels),
                 'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0,
-                'precision': 0.0, 'recall': 0.0, 'f1': 0.0
+                'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0
             })
         
         self.processed_rows += rows_to_process
@@ -470,7 +475,7 @@ class DataProcessor:
                     'sheet_name': sheet_name,
                     'n': 0, 'lp': 0, 'ln': 0, 'pp': 0, 'pn': 0,
                     'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0,
-                    'precision': 0.0, 'recall': 0.0, 'f1': 0.0
+                    'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0
                 })
         
         print(f"Total rows processed: {self.processed_rows}")
@@ -514,7 +519,7 @@ class DataProcessor:
         """
         with open(csv_file, 'w', encoding='utf-8') as f:
             # Write header
-            header = "sheet_name;n;lp;ln;pp;pn;tp;fp;tn;fn;precision;recall;f1\n"
+            header = "sheet_name;n;lp;ln;pp;pn;tp;fp;tn;fn;accuracy;precision;recall;f1\n"
             f.write(header)
             
             # Accumulate totals
@@ -528,7 +533,7 @@ class DataProcessor:
                 line = (
                     f"{metrics['sheet_name']};{metrics['n']};{metrics['lp']};{metrics['ln']};"
                     f"{metrics['pp']};{metrics['pn']};{metrics['tp']};{metrics['fp']};"
-                    f"{metrics['tn']};{metrics['fn']};{metrics['precision']};{metrics['recall']};{metrics['f1']}\n"
+                    f"{metrics['tn']};{metrics['fn']};{metrics['accuracy']};{metrics['precision']};{metrics['recall']};{metrics['f1']}\n"
                 )
                 f.write(line)
                 
@@ -536,7 +541,8 @@ class DataProcessor:
                 for key in total_metrics:
                     total_metrics[key] += metrics[key]
             
-            # Calculate total precision, recall, F1
+            # Calculate total accuracy, precision, recall, F1
+            total_accuracy = (total_metrics['tp'] + total_metrics['tn']) / total_metrics['n'] if total_metrics['n'] > 0 else 0.0
             total_precision = total_metrics['tp'] / total_metrics['pp'] if total_metrics['pp'] > 0 else 0.0
             total_recall = total_metrics['tp'] / total_metrics['lp'] if total_metrics['lp'] > 0 else 0.0
             total_f1 = 2 * total_precision * total_recall / (total_precision + total_recall) if (total_precision + total_recall) > 0 else 0.0
@@ -545,12 +551,12 @@ class DataProcessor:
             total_line = (
                 f"TOTAL;{total_metrics['n']};{total_metrics['lp']};{total_metrics['ln']};"
                 f"{total_metrics['pp']};{total_metrics['pn']};{total_metrics['tp']};{total_metrics['fp']};"
-                f"{total_metrics['tn']};{total_metrics['fn']};{round(total_precision, 3)};{round(total_recall, 3)};{round(total_f1, 3)}\n"
+                f"{total_metrics['tn']};{total_metrics['fn']};{round(total_accuracy, 3)};{round(total_precision, 3)};{round(total_recall, 3)};{round(total_f1, 3)}\n"
             )
             f.write(total_line)
 
 
-def generate_output_filename(model_provider: str, model_name: str, method: str, experiment_num: int = 1, label: str = None) -> str:
+def generate_output_filename(model_provider: str, model_name: str, method: str, experiment_num: int = 1, label: str = None, prompt_num: int = 1) -> str:
     """
     Generate output filename according to the required format.
     
@@ -559,6 +565,8 @@ def generate_output_filename(model_provider: str, model_name: str, method: str, 
         model_name: The specific model name
         method: Processing method description
         experiment_num: Experiment number
+        label: Optional label prefix
+        prompt_num: Prompt number (1-5)
         
     Returns:
         Formatted filename
@@ -567,10 +575,10 @@ def generate_output_filename(model_provider: str, model_name: str, method: str, 
     model_id = f"{model_provider}-{model_name.replace('/', '-').replace('.', '-')}"
     
     prefix = f"Result-{label}-" if label else "Result-"
-    return f"{prefix}{model_id}-{method}-experiment{experiment_num}.xlsx"
+    return f"{prefix}{model_id}-prompt{prompt_num}-{method}-experiment{experiment_num}.xlsx"
 
 
-def find_next_experiment_number(model_provider: str, model_name: str, method: str, label: str = None) -> int:
+def find_next_experiment_number(model_provider: str, model_name: str, method: str, label: str = None, prompt_num: int = 1) -> int:
     """
     Find the next available experiment number.
     
@@ -578,13 +586,15 @@ def find_next_experiment_number(model_provider: str, model_name: str, method: st
         model_provider: The model provider
         model_name: The model name
         method: Processing method
+        label: Optional label prefix
+        prompt_num: Prompt number (1-5)
         
     Returns:
         Next available experiment number
     """
     experiment_num = 1
     while True:
-        filename = generate_output_filename(model_provider, model_name, method, experiment_num, label)
+        filename = generate_output_filename(model_provider, model_name, method, experiment_num, label, prompt_num)
         if not os.path.exists(filename):
             return experiment_num
         experiment_num += 1

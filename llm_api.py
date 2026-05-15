@@ -15,10 +15,11 @@ from config import SYSTEM_PROMPT, SUPPORTED_MODELS
 class LLMClient:
     """Base class for LLM API clients."""
     
-    def __init__(self, model_name: str, api_key: str, queries_per_minute: Optional[int] = None):
+    def __init__(self, model_name: str, api_key: str, queries_per_minute: Optional[int] = None, system_prompt: str = None):
         self.model_name = model_name
         self.api_key = api_key
         self.queries_per_minute = queries_per_minute
+        self.system_prompt = system_prompt or SYSTEM_PROMPT
         
         # Calculate delay between requests based on rate limit
         if queries_per_minute:
@@ -70,8 +71,8 @@ class LLMClient:
 class DeepSeekClient(LLMClient):
     """DeepSeek API client."""
     
-    def __init__(self, api_key: str, model: str = "deepseek-chat", queries_per_minute: Optional[int] = None):
-        super().__init__(model, api_key, queries_per_minute)
+    def __init__(self, api_key: str, model: str = "deepseek-v4-flash", queries_per_minute: Optional[int] = None, system_prompt: str = None):
+        super().__init__(model, api_key, queries_per_minute, system_prompt)
         self.client = OpenAI(
             api_key=api_key,
             base_url="https://api.deepseek.com"
@@ -84,7 +85,7 @@ class DeepSeekClient(LLMClient):
             completion = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": text}
                 ],
                 store=True
@@ -102,8 +103,8 @@ class DeepSeekClient(LLMClient):
 class OpenAIClient(LLMClient):
     """OpenAI API client."""
     
-    def __init__(self, api_key: str, model: str = "gpt-4o", queries_per_minute: Optional[int] = None):
-        super().__init__(model, api_key, queries_per_minute)
+    def __init__(self, api_key: str, model: str = "gpt-4.1", queries_per_minute: Optional[int] = None, system_prompt: str = None):
+        super().__init__(model, api_key, queries_per_minute, system_prompt)
         self.client = OpenAI(api_key=api_key)
     
     def process_text(self, text: str) -> str:
@@ -113,7 +114,7 @@ class OpenAIClient(LLMClient):
             completion = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": text}
                 ]
             )
@@ -130,8 +131,8 @@ class OpenAIClient(LLMClient):
 class GeminiClient(LLMClient):
     """Google Gemini API client."""
     
-    def __init__(self, api_key: str, model: str = "gemini-1.5-flash", queries_per_minute: Optional[int] = None):
-        super().__init__(model, api_key, queries_per_minute)
+    def __init__(self, api_key: str, model: str = "gemini-3.1-flash-lite", queries_per_minute: Optional[int] = None, system_prompt: str = None):
+        super().__init__(model, api_key, queries_per_minute, system_prompt)
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model)
         # Override default delay if not explicitly set via queries_per_minute
@@ -142,7 +143,7 @@ class GeminiClient(LLMClient):
         """Process text using Gemini API."""
         self._wait_for_rate_limit()
         try:
-            prompt = f"{SYSTEM_PROMPT}\n\nUser: {text}"
+            prompt = f"{self.system_prompt}\n\nUser: {text}"
             response = self.model.generate_content(prompt)
             
             result = response.text
@@ -158,8 +159,8 @@ class GeminiClient(LLMClient):
 class MamayLMClient(LLMClient):
     """MamayLM local inference client using Hugging Face transformers pipeline."""
     
-    def __init__(self, model_name: str = "INSAIT-Institute/MamayLM-Gemma-3-12B-IT-v1.0"):
-        super().__init__(model_name, api_key=None)
+    def __init__(self, model_name: str = "INSAIT-Institute/MamayLM-Gemma-3-12B-IT-v1.0", system_prompt: str = None):
+        super().__init__(model_name, api_key=None, system_prompt=system_prompt)
         try:
             from transformers import pipeline
         except ImportError:
@@ -181,7 +182,7 @@ class MamayLMClient(LLMClient):
             messages = [
                 {
                     "role": "system",
-                    "content": [{"type": "text", "text": SYSTEM_PROMPT}]
+                    "content": [{"type": "text", "text": self.system_prompt}]
                 },
                 {
                     "role": "user",
@@ -212,7 +213,7 @@ class MamayLMClient(LLMClient):
 
         conversations = [
             [
-                {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+                {"role": "system", "content": [{"type": "text", "text": self.system_prompt}]},
                 {"role": "user", "content": [{"type": "text", "text": text}]},
             ]
             for text in texts
@@ -281,8 +282,8 @@ class MamayLMClient(LLMClient):
 class LapaClient(LLMClient):
     """Lapa local inference client using Hugging Face transformers pipeline."""
     
-    def __init__(self, model_name: str = "lapa-llm/lapa-v0.1.2-instruct"):
-        super().__init__(model_name, api_key=None)
+    def __init__(self, model_name: str = "lapa-llm/lapa-v0.1.2-instruct", system_prompt: str = None):
+        super().__init__(model_name, api_key=None, system_prompt=system_prompt)
         try:
             from transformers import pipeline
         except ImportError:
@@ -304,7 +305,7 @@ class LapaClient(LLMClient):
             messages = [
                 {
                     "role": "system",
-                    "content": [{"type": "text", "text": SYSTEM_PROMPT}]
+                    "content": [{"type": "text", "text": self.system_prompt}]
                 },
                 {
                     "role": "user",
@@ -335,7 +336,7 @@ class LapaClient(LLMClient):
 
         conversations = [
             [
-                {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+                {"role": "system", "content": [{"type": "text", "text": self.system_prompt}]},
                 {"role": "user", "content": [{"type": "text", "text": text}]},
             ]
             for text in texts
@@ -401,11 +402,82 @@ class LapaClient(LLMClient):
         return results
 
 
+class XAIClient(LLMClient):
+    """xAI XAI API client using the Responses API (api.x.ai)."""
+
+    def __init__(self, api_key: str, model: str = "grok-3", queries_per_minute: Optional[int] = None, system_prompt: str = None):
+        super().__init__(model, api_key, queries_per_minute, system_prompt)
+        self.api_url = "https://api.x.ai/v1/responses"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+
+    def process_text(self, text: str) -> str:
+        """Process text using xAI XAI Responses API."""
+        self._wait_for_rate_limit()
+        try:
+            payload = {
+                "model": self.model_name,
+                "instructions": self.system_prompt,
+                "input": text
+            }
+            response = requests.post(self.api_url, headers=self.headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+            # Extract text from the message output item
+            for item in data.get("output", []):
+                if item.get("type") == "message":
+                    for content in item.get("content", []):
+                        if content.get("type") == "output_text":
+                            result = content["text"].strip()
+                            print(f"XAI result: {result[:100]}...")
+                            return result
+
+            return "0 Error"
+
+        except Exception as e:
+            print(f"XAI API error: {e}")
+            return "0 Error"
+
+
+class GroqClient(LLMClient):
+    """Groq API client for Llama 4 and other models."""
+
+    def __init__(self, api_key: str, model: str = "meta-llama/llama-4-maverick-17b-128e-instruct", queries_per_minute: Optional[int] = None, system_prompt: str = None):
+        super().__init__(model, api_key, queries_per_minute, system_prompt)
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1"
+        )
+
+    def process_text(self, text: str) -> str:
+        """Process text using Groq API."""
+        self._wait_for_rate_limit()
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": text}
+                ]
+            )
+
+            result = completion.choices[0].message.content
+            print(f"Groq result: {result[:100]}...")
+            return result
+
+        except Exception as e:
+            print(f"Groq API error: {e}")
+            return "0 Error"
+
+
 class QwenClient(LLMClient):
     """Qwen2.5 local inference client using Hugging Face transformers pipeline."""
     
-    def __init__(self, model_name: str = "Qwen/Qwen2.5-14B-Instruct"):
-        super().__init__(model_name, api_key=None)
+    def __init__(self, model_name: str = "Qwen/Qwen2.5-14B-Instruct", system_prompt: str = None):
+        super().__init__(model_name, api_key=None, system_prompt=system_prompt)
         try:
             from transformers import pipeline
         except ImportError:
@@ -425,7 +497,7 @@ class QwenClient(LLMClient):
         """Process text using local Qwen model via pipeline."""
         try:
             messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": text},
             ]
             output = self.pipe(messages, max_new_tokens=20)
@@ -450,7 +522,7 @@ class QwenClient(LLMClient):
         """Process multiple texts using pipeline dataset batching for GPU efficiency."""
         conversations = [
             [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": text},
             ]
             for text in texts
@@ -480,7 +552,7 @@ class QwenClient(LLMClient):
                 results.append(self.process_text(text))
 
         return results
-def create_llm_client(provider: str, api_key: str, model: Optional[str] = None, queries_per_minute: Optional[int] = None) -> LLMClient:
+def create_llm_client(provider: str, api_key: str, model: Optional[str] = None, queries_per_minute: Optional[int] = None, system_prompt: str = None) -> LLMClient:
     """
     Factory function to create the appropriate LLM client.
     
@@ -489,6 +561,7 @@ def create_llm_client(provider: str, api_key: str, model: Optional[str] = None, 
         api_key: API key for the provider
         model: Specific model name (optional, uses default if not provided)
         queries_per_minute: Maximum number of API queries per minute (optional)
+        system_prompt: System prompt to use (optional, uses default if not provided)
     
     Returns:
         LLMClient instance
@@ -500,17 +573,21 @@ def create_llm_client(provider: str, api_key: str, model: Optional[str] = None, 
     model_name = model or model_config['default_model']
     
     if provider == 'deepseek':
-        return DeepSeekClient(api_key, model_name, queries_per_minute)
+        return DeepSeekClient(api_key, model_name, queries_per_minute, system_prompt)
     elif provider == 'openai':
-        return OpenAIClient(api_key, model_name, queries_per_minute)
+        return OpenAIClient(api_key, model_name, queries_per_minute, system_prompt)
     elif provider == 'gemini':
-        return GeminiClient(api_key, model_name, queries_per_minute)
+        return GeminiClient(api_key, model_name, queries_per_minute, system_prompt)
     elif provider == 'lapa':
-        return LapaClient(model_name)
+        return LapaClient(model_name, system_prompt)
     elif provider == 'mamaylm':
-        return MamayLMClient(model_name)
+        return MamayLMClient(model_name, system_prompt)
     elif provider == 'qwen':
-        return QwenClient(model_name)
+        return QwenClient(model_name, system_prompt)
+    elif provider == 'groq':
+        return GroqClient(api_key, model_name, queries_per_minute, system_prompt)
+    elif provider == 'xai':
+        return XAIClient(api_key, model_name, queries_per_minute, system_prompt)
     else:
         raise ValueError(f"Provider {provider} not implemented")
 
