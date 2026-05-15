@@ -8,8 +8,8 @@ Supports two finetuning modes:
      embeddings while keeping all network weights frozen
 
 This script:
-1. Loads data from all sheets of PETs_Ukr.xlsx with training phrases containing words in angular brackets
-2. Splits each sheet's data 50/25/25 for train/validation/test
+1. Loads training data from PETs_Ukr_Train.xlsx (split 80/20 into train/validation)
+2. Loads test data from PETs_Ukr_Test.xlsx for evaluation
 3. Combines all training, validation, and test data from all sheets
 4. Finetunes MamayLM using LoRA/PEFT or prompt tuning with validation tracking
 5. Saves the finetuned model
@@ -88,38 +88,62 @@ def format_prompt(text: str, label: int = None, include_system_prompt: bool = Tr
         return f"{prefix}\n\nUser: {user_prompt}\nAssistant:"
 
 
-def load_and_split_data(xlsx_path: str = "PETs_Ukr.xlsx"):
-    """Load data from all sheets of PETs_Ukr.xlsx and split each sheet 50/25/25 for train/val/test.
+def load_and_split_data(train_path: str = "PETs_Ukr_Train.xlsx",
+                        test_path: str = "PETs_Ukr_Test.xlsx"):
+    """Load training data from PETs_Ukr_Train.xlsx (split into train/val)
+    and test data from PETs_Ukr_Test.xlsx.
 
     The training phrases contain the word/phrase in angular brackets (e.g., <word>)
-    as specified in the 'text' column of PETs_Ukr.xlsx.
+    as specified in the 'text' column.
     """
-    print(f"Loading data from all sheets in {xlsx_path}...")
+    # ── Load training file and split into train / validation ──────────────
+    print(f"Loading training data from {train_path}...")
+    xl_train = pd.ExcelFile(train_path)
+    print(f"Found {len(xl_train.sheet_names)} sheets: {xl_train.sheet_names}")
 
-    # Load all sheets
-    xl = pd.ExcelFile(xlsx_path)
-    sheet_names = xl.sheet_names
-    print(f"Found {len(sheet_names)} sheets: {sheet_names}")
-
-    # Lists to collect all training, validation, and test data
     all_train_texts = []
     all_train_labels = []
     all_val_texts = []
     all_val_labels = []
+
+    for sheet_name in xl_train.sheet_names:
+        print(f"\nProcessing training sheet: {sheet_name}")
+        df = pd.read_excel(train_path, sheet_name=sheet_name)
+        print(f"  Loaded {len(df)} examples from '{sheet_name}'")
+
+        texts = df['text'].values
+        labels = df['label'].values
+        print(f"  Label distribution: {dict(pd.Series(labels).value_counts())}")
+
+        # Split training file: 80% train, 20% validation
+        train_texts, val_texts, train_labels, val_labels = train_test_split(
+            texts, labels,
+            test_size=0.2, random_state=42
+        )
+
+        print(f"  Training: {len(train_texts)} examples, Validation: {len(val_texts)} examples")
+
+        all_train_texts.extend(train_texts)
+        all_train_labels.extend(train_labels)
+        all_val_texts.extend(val_texts)
+        all_val_labels.extend(val_labels)
+
+    # ── Load test file ────────────────────────────────────────────────────
+    print(f"\nLoading test data from {test_path}...")
+    xl_test = pd.ExcelFile(test_path)
+    print(f"Found {len(xl_test.sheet_names)} sheets: {xl_test.sheet_names}")
+
     all_test_texts = []
     all_test_labels = []
     all_test_categories = []
 
-    # Process each sheet separately
-    for sheet_name in sheet_names:
-        print(f"\nProcessing sheet: {sheet_name}")
-        df = pd.read_excel(xlsx_path, sheet_name=sheet_name)
+    for sheet_name in xl_test.sheet_names:
+        print(f"\nProcessing test sheet: {sheet_name}")
+        df = pd.read_excel(test_path, sheet_name=sheet_name)
         print(f"  Loaded {len(df)} examples from '{sheet_name}'")
 
-        # Get text (with angular brackets) and labels
         texts = df['text'].values
         labels = df['label'].values
-        # Use sheet name as category (some sheets don't have 'category' column)
         if 'category' in df.columns:
             categories = df['category'].values
         else:
@@ -127,41 +151,11 @@ def load_and_split_data(xlsx_path: str = "PETs_Ukr.xlsx"):
 
         print(f"  Label distribution: {dict(pd.Series(labels).value_counts())}")
 
-        # Split data: 50% for training, 25% for validation, 25% for testing
-        try:
-            train_texts, temp_texts, train_labels, temp_labels, train_idx, temp_idx = train_test_split(
-                texts, labels, np.arange(len(texts)),
-                test_size=0.5, random_state=42, stratify=labels
-            )
-            val_texts, test_texts, val_labels, test_labels, val_idx, test_idx = train_test_split(
-                temp_texts, temp_labels, temp_idx,
-                test_size=0.5, random_state=42, stratify=temp_labels
-            )
-        except ValueError:
-            print(f"  Warning: Cannot stratify sheet '{sheet_name}', using simple split")
-            train_texts, temp_texts, train_labels, temp_labels, train_idx, temp_idx = train_test_split(
-                texts, labels, np.arange(len(texts)),
-                test_size=0.5, random_state=42
-            )
-            val_texts, test_texts, val_labels, test_labels, val_idx, test_idx = train_test_split(
-                temp_texts, temp_labels, temp_idx,
-                test_size=0.5, random_state=42
-            )
+        all_test_texts.extend(texts)
+        all_test_labels.extend(labels)
+        all_test_categories.extend(categories)
 
-        test_categories = categories[test_idx]
-
-        print(f"  Training: {len(train_texts)} examples, Validation: {len(val_texts)} examples, Test: {len(test_texts)} examples")
-
-        # Add to combined lists
-        all_train_texts.extend(train_texts)
-        all_train_labels.extend(train_labels)
-        all_val_texts.extend(val_texts)
-        all_val_labels.extend(val_labels)
-        all_test_texts.extend(test_texts)
-        all_test_labels.extend(test_labels)
-        all_test_categories.extend(test_categories)
-
-    # Convert to numpy arrays
+    # ── Convert to numpy arrays ───────────────────────────────────────────
     all_train_texts = np.array(all_train_texts)
     all_train_labels = np.array(all_train_labels)
     all_val_texts = np.array(all_val_texts)
@@ -742,10 +736,16 @@ def main():
         help='Path to finetuned model (default: auto-selected based on mode)'
     )
     parser.add_argument(
-        '--data-path',
+        '--train-data',
         type=str,
-        default='PETs_Ukr.xlsx',
-        help='Path to data file (default: PETs_Ukr.xlsx)'
+        default='PETs_Ukr_Train.xlsx',
+        help='Path to training data file (default: PETs_Ukr_Train.xlsx)'
+    )
+    parser.add_argument(
+        '--test-data',
+        type=str,
+        default='PETs_Ukr_Test.xlsx',
+        help='Path to test data file (default: PETs_Ukr_Test.xlsx)'
     )
     parser.add_argument(
         '--show-all-queries',
@@ -797,7 +797,7 @@ def main():
         return
 
     # Load and split data
-    train_texts, train_labels, val_texts, val_labels, test_texts, test_labels, test_categories = load_and_split_data(args.data_path)
+    train_texts, train_labels, val_texts, val_labels, test_texts, test_labels, test_categories = load_and_split_data(args.train_data, args.test_data)
 
     # Finetune model (unless eval-only)
     if not args.eval_only:

@@ -1,39 +1,36 @@
 #!/usr/bin/env python3
 """
-Train linear regression model on 50% of data and evaluate it on words from different sheets.
-This script combines training and per-sheet evaluation in one workflow.
+Train linear regression model on training data and evaluate it per-sheet on test data.
+Uses embeddings_train.csv (from PETs_Ukr_Train.xlsx) for training
+and embeddings_test.csv (from PETs_Ukr_Test.xlsx) for evaluation.
 """
 
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import pickle
 
 def main():
-    # Load embeddings
-    print("Loading embeddings from CSV...")
-    df = pd.read_csv('embeddings_with_labels.csv')
-    print(f"Loaded {len(df)} examples from {df['sheet'].nunique()} sheets")
+    # Load training embeddings
+    print("Loading training embeddings...")
+    train_df = pd.read_csv('embeddings_train.csv')
+    embedding_cols = [col for col in train_df.columns if col.startswith('emb_')]
+    X_train = train_df[embedding_cols].values
+    y_train = train_df['label'].values
     
-    # Separate features (embeddings) and labels
-    embedding_cols = [col for col in df.columns if col.startswith('emb_')]
-    X = df[embedding_cols].values
-    y = df['label'].values
-    sheets = df['sheet'].values
+    print(f"Training set: {len(X_train)} examples from {train_df['sheet'].nunique()} sheets")
+    print(f"Feature dimension: {X_train.shape[1]}")
+    print(f"Training label distribution:\n{pd.Series(y_train).value_counts()}")
     
-    print(f"Feature dimension: {X.shape[1]}")
-    print(f"Label distribution:\n{pd.Series(y).value_counts()}")
+    # Load test embeddings
+    print("\nLoading test embeddings...")
+    test_df = pd.read_csv('embeddings_test.csv')
+    X_test = test_df[embedding_cols].values
+    y_test = test_df['label'].values
+    sheets_test = test_df['sheet'].values
     
-    # Split data: 50% for training, 50% for testing
-    print("\nSplitting data (50% train, 50% test)...")
-    X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
-        X, y, np.arange(len(X)), test_size=0.5, random_state=42, stratify=y
-    )
-    
-    print(f"Training set: {len(X_train)} examples")
-    print(f"Test set: {len(X_test)} examples")
+    print(f"Test set: {len(X_test)} examples from {test_df['sheet'].nunique()} sheets")
     
     # Train linear regression model
     print("\nTraining linear regression model...")
@@ -55,22 +52,18 @@ def main():
     print(f"  MSE: {train_mse:.4f}")
     print(f"  R² score: {train_r2:.4f}")
     
-    # Make predictions only on test set (data not in training)
+    # Make predictions on test set
     print("\nMaking predictions on test set for per-sheet evaluation...")
     y_pred_test = model.predict(X_test)
     y_pred_binary_test = (y_pred_test >= 0.5).astype(int)
     
-    # Get sheet information for test set only
-    sheets_test = sheets[idx_test]
-    
-    # Calculate statistics per sheet (only for test set)
-    print("\nCalculating per-sheet statistics (test set only)...")
+    # Calculate statistics per sheet on the test set
+    print("\nCalculating per-sheet statistics (test set)...")
     sheet_stats = []
     
-    for sheet_name in sorted(df['sheet'].unique()):
+    for sheet_name in sorted(test_df['sheet'].unique()):
         mask = sheets_test == sheet_name
         
-        # Skip if no test samples for this sheet
         if mask.sum() == 0:
             continue
             
@@ -99,7 +92,6 @@ def main():
         recall_sheet = tp / (tp + fn) if (tp + fn) > 0 else 0
         f1_sheet = 2 * (precision_sheet * recall_sheet) / (precision_sheet + recall_sheet) if (precision_sheet + recall_sheet) > 0 else 0
         
-        # Prediction statistics
         pred_mean = y_pred_sheet.mean()
         pred_std = y_pred_sheet.std()
         pred_min = y_pred_sheet.min()
@@ -128,7 +120,6 @@ def main():
             'pred_max': pred_max
         })
     
-    # Create DataFrame and save to CSV
     sheet_stats_df = pd.DataFrame(sheet_stats)
     
     # Calculate total statistics across all test samples
@@ -155,7 +146,6 @@ def main():
     total_pred_min = y_pred_test.min()
     total_pred_max = y_pred_test.max()
     
-    # Add total statistics as the last row
     total_row = pd.DataFrame([{
         'sheet': 'TOTAL',
         'n_samples': total_samples,

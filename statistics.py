@@ -105,6 +105,9 @@ def print_statistics(stats: Dict[str, Any]) -> None:
 
 
 if __name__ == "__main__":
-    # Test the statistics module
-    stats = get_file_statistics("PETs_Ukr.xlsx")
+    print("=== Training Data ===")
+    stats = get_file_statistics("PETs_Ukr_Train.xlsx")
+    print_statistics(stats)
+    print("\n=== Test Data ===")
+    stats = get_file_statistics("PETs_Ukr_Test.xlsx")
     print_statistics(stats)

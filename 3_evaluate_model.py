@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Step 3: Evaluate the quality of the linear regression predictor on test set.
+Step 3: Evaluate the quality of the linear regression predictor on the test set.
+Uses embeddings_test.csv (produced from PETs_Ukr_Test.xlsx).
 """
 
 import pandas as pd
@@ -14,15 +15,13 @@ print("Loading trained model...")
 with open('linear_regression_model.pkl', 'rb') as f:
     model = pickle.load(f)
 
-# Load train/test split
-print("Loading train/test split...")
-with open('train_test_split.pkl', 'rb') as f:
-    split_data = pickle.load(f)
-
-X_train = split_data['X_train']
-X_test = split_data['X_test']
-y_train = split_data['y_train']
-y_test = split_data['y_test']
+# Load test embeddings
+print("Loading test embeddings...")
+test_df = pd.read_csv('embeddings_test.csv')
+embedding_cols = [col for col in test_df.columns if col.startswith('emb_')]
+X_test = test_df[embedding_cols].values
+y_test = test_df['label'].values
+sheets_test = test_df['sheet'].values
 
 print(f"Test set size: {len(X_test)} examples")
 
@@ -82,27 +81,14 @@ print(f"  Std prediction:  {y_pred.std():.4f}")
 print("\nActual label distribution:")
 print(pd.Series(y_test).value_counts().sort_index())
 
-# Load original embeddings CSV to get sheet information
+# Calculate per-sheet statistics on the test set
 print("\nCalculating per-sheet statistics...")
-embeddings_df = pd.read_csv('embeddings_with_labels.csv')
-
-# Get embedding columns
-embed_cols = [col for col in embeddings_df.columns if col.startswith('emb_')]
-X_all = embeddings_df[embed_cols].values
-y_all = embeddings_df['label'].values
-sheets = embeddings_df['sheet'].values
-
-# Make predictions for all data
-y_pred_all = model.predict(X_all)
-y_pred_binary_all = (y_pred_all >= 0.5).astype(int)
-
-# Calculate statistics per sheet
 sheet_stats = []
-for sheet_name in sorted(embeddings_df['sheet'].unique()):
-    mask = sheets == sheet_name
-    y_true_sheet = y_all[mask]
-    y_pred_sheet = y_pred_all[mask]
-    y_pred_bin_sheet = y_pred_binary_all[mask]
+for sheet_name in sorted(test_df['sheet'].unique()):
+    mask = sheets_test == sheet_name
+    y_true_sheet = y_test[mask]
+    y_pred_sheet = y_pred[mask]
+    y_pred_bin_sheet = y_pred_binary[mask]
     
     n_samples = mask.sum()
     n_label_0 = (y_true_sheet == 0).sum()
