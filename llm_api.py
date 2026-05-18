@@ -43,27 +43,28 @@ class LLMClient:
     
     def process_batch(self, texts: List[str], max_workers: int = 10) -> List[str]:
         """Process multiple texts in parallel."""
-        results = []
         
         # If rate limiting is strict, process sequentially
         if self.queries_per_minute and self.queries_per_minute < 10:
             max_workers = 1
         
+        results = [None] * len(texts)
+        
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_text = {
-                executor.submit(self.process_text, text): text 
-                for text in texts
+            # Submit all tasks, mapping each future to its index
+            future_to_index = {
+                executor.submit(self.process_text, text): i 
+                for i, text in enumerate(texts)
             }
             
-            # Collect results in order
-            for future in as_completed(future_to_text):
+            # Collect results, placing each into its correct position
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
                 try:
-                    result = future.result()
-                    results.append(result)
+                    results[idx] = future.result()
                 except Exception as e:
                     print(f"Error processing text: {e}")
-                    results.append("0 Error")
+                    results[idx] = "0 Error"
         
         return results
 
