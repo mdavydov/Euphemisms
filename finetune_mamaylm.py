@@ -7,20 +7,26 @@ Supports two finetuning modes:
   2. Prompt tuning (--prompt-tuning) – finetunes only the system-prompt
      embeddings while keeping all network weights frozen
 
+Evaluation supports three model sources:
+  1. Fine-tuned LoRA model (default)
+  2. Prompt-tuned model (--prompt-tuning)
+  3. Original base model (--original) – no fine-tuning applied
+
 This script:
 1. Loads training data from PETs_Ukr_Train.xlsx (split 80/20 into train/validation)
-2. Loads test data from PETs_Ukr_Test.xlsx for evaluation
-3. Combines all training, validation, and test data from all sheets
-4. Finetunes MamayLM using LoRA/PEFT or prompt tuning with validation tracking
-5. Saves the finetuned model
-6. Optionally evaluates the finetuned model on the test set
+   only when finetuning (skipped in --eval-only mode)
+2. Loads test data from PETs_Ukr_Test.xlsx only when evaluating
+3. Finetunes MamayLM using LoRA/PEFT or prompt tuning with validation tracking
+4. Saves the finetuned model
+5. Optionally evaluates the model on the test set
 
 Usage:
-    python finetune_mamaylm.py                          # LoRA finetune
-    python finetune_mamaylm.py --prompt-tuning          # Prompt-tuning finetune
-    python finetune_mamaylm.py --evaluate               # Finetune and evaluate
-    python finetune_mamaylm.py --eval-only              # Only evaluate existing model
-    python finetune_mamaylm.py --prompt-tuning --eval-only  # Evaluate prompt-tuned model
+    python finetune_mamaylm.py                                    # LoRA finetune
+    python finetune_mamaylm.py --prompt-tuning                    # Prompt-tuning finetune
+    python finetune_mamaylm.py --evaluate                         # Finetune and evaluate
+    python finetune_mamaylm.py --eval-only                        # Evaluate fine-tuned model
+    python finetune_mamaylm.py --eval-only --original             # Evaluate original base model
+    python finetune_mamaylm.py --prompt-tuning --eval-only        # Evaluate prompt-tuned model
     python finetune_mamaylm.py --predict "Text with <word>" --model-path ./path
 """
 
@@ -88,15 +94,12 @@ def format_prompt(text: str, label: int = None, include_system_prompt: bool = Tr
         return f"{prefix}\n\nUser: {user_prompt}\nAssistant:"
 
 
-def load_and_split_data(train_path: str = "PETs_Ukr_Train.xlsx",
-                        test_path: str = "PETs_Ukr_Test.xlsx"):
-    """Load training data from PETs_Ukr_Train.xlsx (split into train/val)
-    and test data from PETs_Ukr_Test.xlsx.
+def load_train_val_data(train_path: str = "PETs_Ukr_Train.xlsx"):
+    """Load training data from an xlsx file and split 80/20 into train/validation.
 
     The training phrases contain the word/phrase in angular brackets (e.g., <word>)
     as specified in the 'text' column.
     """
-    # ── Load training file and split into train / validation ──────────────
     print(f"Loading training data from {train_path}...")
     xl_train = pd.ExcelFile(train_path)
     print(f"Found {len(xl_train.sheet_names)} sheets: {xl_train.sheet_names}")
@@ -115,7 +118,7 @@ def load_and_split_data(train_path: str = "PETs_Ukr_Train.xlsx",
         labels = df['label'].values
         print(f"  Label distribution: {dict(pd.Series(labels).value_counts())}")
 
-        # Split training file: 80% train, 20% validation
+        # Split: 80% train, 20% validation
         train_texts, val_texts, train_labels, val_labels = train_test_split(
             texts, labels,
             test_size=0.2, random_state=42
@@ -128,7 +131,25 @@ def load_and_split_data(train_path: str = "PETs_Ukr_Train.xlsx",
         all_val_texts.extend(val_texts)
         all_val_labels.extend(val_labels)
 
-    # ── Load test file ────────────────────────────────────────────────────
+    all_train_texts = np.array(all_train_texts)
+    all_train_labels = np.array(all_train_labels)
+    all_val_texts = np.array(all_val_texts)
+    all_val_labels = np.array(all_val_labels)
+
+    print("\n" + "="*80)
+    print("TRAINING DATASET STATISTICS")
+    print("="*80)
+    print(f"Total training examples:   {len(all_train_texts)}")
+    print(f"Total validation examples: {len(all_val_texts)}")
+    print(f"Training label distribution:   {dict(pd.Series(all_train_labels).value_counts())}")
+    print(f"Validation label distribution: {dict(pd.Series(all_val_labels).value_counts())}")
+    print("="*80)
+
+    return all_train_texts, all_train_labels, all_val_texts, all_val_labels
+
+
+def load_test_data(test_path: str = "PETs_Ukr_Test.xlsx"):
+    """Load test data from an xlsx file for evaluation."""
     print(f"\nLoading test data from {test_path}...")
     xl_test = pd.ExcelFile(test_path)
     print(f"Found {len(xl_test.sheet_names)} sheets: {xl_test.sheet_names}")
@@ -155,28 +176,19 @@ def load_and_split_data(train_path: str = "PETs_Ukr_Train.xlsx",
         all_test_labels.extend(labels)
         all_test_categories.extend(categories)
 
-    # ── Convert to numpy arrays ───────────────────────────────────────────
-    all_train_texts = np.array(all_train_texts)
-    all_train_labels = np.array(all_train_labels)
-    all_val_texts = np.array(all_val_texts)
-    all_val_labels = np.array(all_val_labels)
     all_test_texts = np.array(all_test_texts)
     all_test_labels = np.array(all_test_labels)
     all_test_categories = np.array(all_test_categories)
 
     print("\n" + "="*80)
-    print("COMBINED DATASET STATISTICS")
+    print("TEST DATASET STATISTICS")
     print("="*80)
-    print(f"Total training examples: {len(all_train_texts)}")
-    print(f"Total validation examples: {len(all_val_texts)}")
     print(f"Total test examples: {len(all_test_texts)}")
-    print(f"Training label distribution: {dict(pd.Series(all_train_labels).value_counts())}")
-    print(f"Validation label distribution: {dict(pd.Series(all_val_labels).value_counts())}")
     print(f"Test label distribution: {dict(pd.Series(all_test_labels).value_counts())}")
     print(f"Test categories: {sorted(np.unique(all_test_categories))}")
     print("="*80)
 
-    return all_train_texts, all_train_labels, all_val_texts, all_val_labels, all_test_texts, all_test_labels, all_test_categories
+    return all_test_texts, all_test_labels, all_test_categories
 
 
 def prepare_dataset(texts, labels, tokenizer, include_system_prompt: bool = True):
@@ -550,6 +562,25 @@ def load_prompt_tuned_model(model_path: str = PROMPT_TUNING_OUTPUT_DIR):
     return tokenizer, model
 
 
+def load_original_model():
+    """Load the original base MamayLM model without any fine-tuning."""
+    print(f"Loading original base model: {MODEL_NAME}...")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        device_map="cuda:0",
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    )
+
+    print("Original base model loaded successfully!")
+    return tokenizer, model
+
+
 def predict_single(text: str, tokenizer, model, prompt_tuning: bool = False) -> int:
     """Make a prediction for a single text with memory optimization."""
     prompt = format_prompt(text, include_system_prompt=not prompt_tuning)
@@ -582,15 +613,29 @@ def predict_single(text: str, tokenizer, model, prompt_tuning: bool = False) -> 
 def evaluate_model(test_texts, test_labels, test_categories,
                    model_path: str = OUTPUT_DIR,
                    show_all_queries: bool = False,
-                   prompt_tuning: bool = False):
-    """Evaluate the finetuned model on test set."""
+                   prompt_tuning: bool = False,
+                   original: bool = False):
+    """Evaluate a model on the test set.
+
+    Three model sources are supported:
+      - original=True:      base MamayLM without any fine-tuning
+      - prompt_tuning=True: prompt-tuned PEFT adapter
+      - default (LoRA):     fine-tuned LoRA adapter
+    """
     print("\n" + "="*80)
-    mode_label = "PROMPT-TUNED" if prompt_tuning else "FINETUNED"
+    if original:
+        mode_label = "ORIGINAL (BASE)"
+    elif prompt_tuning:
+        mode_label = "PROMPT-TUNED"
+    else:
+        mode_label = "FINETUNED (LoRA)"
     print(f"EVALUATING {mode_label} MODEL")
     print("="*80)
 
     # Load the appropriate model
-    if prompt_tuning:
+    if original:
+        tokenizer, model = load_original_model()
+    elif prompt_tuning:
         tokenizer, model = load_prompt_tuned_model(model_path)
     else:
         tokenizer, model = load_finetuned_model(model_path)
@@ -689,7 +734,12 @@ def evaluate_model(test_texts, test_labels, test_categories,
 
     # Save statistics
     stats_df = pd.DataFrame(category_stats)
-    suffix = "_prompt_tuned" if prompt_tuning else "_finetuned"
+    if original:
+        suffix = "_original"
+    elif prompt_tuning:
+        suffix = "_prompt_tuned"
+    else:
+        suffix = "_finetuned"
     stats_file = f'mamaylm{suffix}_statistics.csv'
     stats_df.to_csv(stats_file, index=False)
     print(f"\n\nPer-category statistics saved to {stats_file}")
@@ -728,6 +778,12 @@ def main():
         '--eval-only',
         action='store_true',
         help='Only evaluate existing finetuned model (skip training)'
+    )
+    parser.add_argument(
+        '--original',
+        action='store_true',
+        help='Evaluate the original base model (no fine-tuning). '
+             'Use with --evaluate or --eval-only.'
     )
     parser.add_argument(
         '--model-path',
@@ -796,21 +852,21 @@ def main():
         print("\nDone!")
         return
 
-    # Load and split data
-    train_texts, train_labels, val_texts, val_labels, test_texts, test_labels, test_categories = load_and_split_data(args.train_data, args.test_data)
-
-    # Finetune model (unless eval-only)
+    # Finetune model (unless eval-only) — train/val data loaded only when needed
     if not args.eval_only:
+        train_texts, train_labels, val_texts, val_labels = load_train_val_data(args.train_data)
         finetune_model(train_texts, train_labels, val_texts, val_labels,
                        args.model_path, prompt_tuning=args.prompt_tuning)
     else:
         print("Skipping finetuning (--eval-only mode)")
 
-    # Evaluate model if requested or if eval-only
+    # Evaluate model if requested or if eval-only — test data loaded only when needed
     if args.evaluate or args.eval_only:
+        test_texts, test_labels, test_categories = load_test_data(args.test_data)
         evaluate_model(test_texts, test_labels, test_categories,
                        args.model_path, args.show_all_queries,
-                       prompt_tuning=args.prompt_tuning)
+                       prompt_tuning=args.prompt_tuning,
+                       original=args.original)
     else:
         print("\nSkipping evaluation. Use --evaluate flag to evaluate the model.")
         print(f"To evaluate later, run: python {__file__} --eval-only")
