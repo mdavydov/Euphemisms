@@ -91,6 +91,7 @@ OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GROQ_API_URL = "https://api.groq.com/openai/v1"
 XAI_API_URL = "https://api.x.ai/v1/responses"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1"
 
 # Default processing limits
 DEFAULT_MAX_ROWS_PER_SHEET = 5
@@ -138,5 +139,10 @@ SUPPORTED_MODELS = {
         'api_url': XAI_API_URL,
         'default_model': 'grok-3',
         'api_key_env': 'XAI_API_KEY'
+    },
+    'openrouter': {
+        'api_url': OPENROUTER_API_URL,
+        'default_model': 'google/gemini-2.5-flash',
+        'api_key_env': 'OPENROUTER_API_KEY'
     }
 }

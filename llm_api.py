@@ -403,6 +403,37 @@ class LapaClient(LLMClient):
         return results
 
 
+class OpenRouterClient(LLMClient):
+    """OpenRouter API client (OpenAI-compatible)."""
+
+    def __init__(self, api_key: str, model: str = "google/gemini-2.5-flash", queries_per_minute: Optional[int] = None, system_prompt: str = None):
+        super().__init__(model, api_key, queries_per_minute, system_prompt)
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1"
+        )
+
+    def process_text(self, text: str) -> str:
+        """Process text using OpenRouter API."""
+        self._wait_for_rate_limit()
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": text}
+                ]
+            )
+
+            result = completion.choices[0].message.content
+            print(f"OpenRouter result: {result[:100]}...")
+            return result
+
+        except Exception as e:
+            print(f"OpenRouter API error: {e}")
+            return "0 Error"
+
+
 class XAIClient(LLMClient):
     """xAI XAI API client using the Responses API (api.x.ai)."""
 
@@ -589,6 +620,8 @@ def create_llm_client(provider: str, api_key: str, model: Optional[str] = None, 
         return GroqClient(api_key, model_name, queries_per_minute, system_prompt)
     elif provider == 'xai':
         return XAIClient(api_key, model_name, queries_per_minute, system_prompt)
+    elif provider == 'openrouter':
+        return OpenRouterClient(api_key, model_name, queries_per_minute, system_prompt)
     else:
         raise ValueError(f"Provider {provider} not implemented")
 
