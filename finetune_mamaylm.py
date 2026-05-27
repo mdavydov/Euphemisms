@@ -34,6 +34,7 @@ Usage:
 """
 
 import argparse
+import math
 import pandas as pd
 import numpy as np
 import torch
@@ -46,6 +47,7 @@ from transformers import (
     AutoModelForCausalLM,
     TrainingArguments,
     Trainer,
+    TrainerCallback,
     DataCollatorForLanguageModeling
 )
 from peft import (
@@ -154,14 +156,20 @@ def load_train_val_data(train_path: str = "PETs_Ukr_Train.xlsx"):
 
 
 def load_test_data(test_path: str = "PETs_Ukr_Test.xlsx"):
-    """Load test data from an xlsx file for evaluation."""
+    """Load test data from an xlsx file for evaluation.
+
+    Returns:
+        Tuple of (texts, labels, sheet_names) where sheet_names tracks the
+        originating sheet for every sample so that per-sheet metrics can be
+        computed identically to process.py.
+    """
     print(f"\nLoading test data from {test_path}...")
     xl_test = pd.ExcelFile(test_path)
     print(f"Found {len(xl_test.sheet_names)} sheets: {xl_test.sheet_names}")
 
     all_test_texts = []
     all_test_labels = []
-    all_test_categories = []
+    all_test_sheet_names = []
 
     for sheet_name in xl_test.sheet_names:
         print(f"\nProcessing test sheet: {sheet_name}")
@@ -170,30 +178,26 @@ def load_test_data(test_path: str = "PETs_Ukr_Test.xlsx"):
 
         texts = df['text'].values
         labels = df['label'].values
-        if 'category' in df.columns:
-            categories = df['category'].values
-        else:
-            categories = np.array([sheet_name] * len(df))
 
         print(f"  Label distribution: {dict(pd.Series(labels).value_counts())}")
 
         all_test_texts.extend(texts)
         all_test_labels.extend(labels)
-        all_test_categories.extend(categories)
+        all_test_sheet_names.extend([sheet_name] * len(df))
 
     all_test_texts = np.array(all_test_texts)
     all_test_labels = np.array(all_test_labels)
-    all_test_categories = np.array(all_test_categories)
+    all_test_sheet_names = np.array(all_test_sheet_names)
 
     print("\n" + "="*80)
     print("TEST DATASET STATISTICS")
     print("="*80)
     print(f"Total test examples: {len(all_test_texts)}")
     print(f"Test label distribution: {dict(pd.Series(all_test_labels).value_counts())}")
-    print(f"Test categories: {sorted(np.unique(all_test_categories))}")
+    print(f"Test sheets: {list(dict.fromkeys(all_test_sheet_names))}")
     print("="*80)
 
-    return all_test_texts, all_test_labels, all_test_categories
+    return all_test_texts, all_test_labels, all_test_sheet_names
 
 
 def prepare_dataset(texts, labels, tokenizer, include_system_prompt: bool = True):
@@ -428,6 +432,96 @@ def extract_and_save_prompt_embeddings(model, output_path: str):
     print("Warning: Could not find prompt embeddings in model parameters")
 
 
+def _preprocess_logits_for_metrics(logits, labels):
+    """Reduce logits to argmax token IDs to save memory during evaluation."""
+    if isinstance(logits, tuple):
+        logits = logits[0]
+    return logits.argmax(dim=-1)
+
+
+def _compute_token_accuracy(eval_preds):
+    """Compute token-level accuracy for causal LM evaluation.
+
+    For causal LM the prediction at position *i* predicts token *i+1*,
+    so we shift predictions and labels before comparing.  Padding
+    positions (label == -100) are ignored.
+    """
+    preds, labels = eval_preds
+    preds = preds[:, :-1]
+    labels = labels[:, 1:]
+    mask = labels != -100
+    correct = (preds[mask] == labels[mask]).sum()
+    total = mask.sum()
+    accuracy = float(correct) / float(total) if total > 0 else 0.0
+    return {'accuracy': round(accuracy, 4)}
+
+
+class _EpochTrainEvalCallback(TrainerCallback):
+    """Evaluates on the *training* set at each epoch end so that training
+    accuracy is available alongside the standard validation metrics."""
+
+    def __init__(self):
+        self.train_metrics_per_epoch = []
+        self._trainer = None
+
+    def set_trainer(self, trainer):
+        self._trainer = trainer
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        if self._trainer is None:
+            return
+        epoch = int(state.epoch)
+        print(f"\n  Evaluating on training set (epoch {epoch})...")
+        metrics = self._trainer.evaluate(
+            self._trainer.train_dataset, metric_key_prefix="train"
+        )
+        self.train_metrics_per_epoch.append({'epoch': epoch, **metrics})
+
+
+def _save_training_stats(trainer, epoch_callback, suffix):
+    """Extract per-epoch statistics from the trainer log history and the
+    epoch callback, then write a semicolon-separated CSV.
+
+    Columns: epoch;train_loss;train_accuracy;eval_loss;eval_accuracy
+    """
+    log_history = trainer.state.log_history
+
+    # Average training loss per epoch from step-level logs
+    epoch_train_losses = {}
+    for entry in log_history:
+        if 'loss' in entry and 'eval_loss' not in entry:
+            ep = math.ceil(entry['epoch'])
+            epoch_train_losses.setdefault(ep, []).append(entry['loss'])
+
+    # Per-epoch eval metrics (from eval_strategy="epoch")
+    eval_per_epoch = {}
+    for entry in log_history:
+        if 'eval_loss' in entry:
+            eval_per_epoch[int(entry['epoch'])] = entry
+
+    # Per-epoch training-set eval metrics from callback
+    train_eval_per_epoch = {}
+    for entry in epoch_callback.train_metrics_per_epoch:
+        train_eval_per_epoch[entry['epoch']] = entry
+
+    all_epochs = sorted(set(epoch_train_losses) | set(eval_per_epoch))
+
+    stats_file = f'mamaylm{suffix}_training_stats.csv'
+    with open(stats_file, 'w', encoding='utf-8') as f:
+        f.write('epoch;train_loss;train_accuracy;eval_loss;eval_accuracy\n')
+        for ep in all_epochs:
+            train_loss = round(float(np.mean(epoch_train_losses.get(ep, [0]))), 4)
+            train_acc = round(float(
+                train_eval_per_epoch.get(ep, {}).get('train_accuracy', 0.0)), 4)
+            eval_loss = round(float(
+                eval_per_epoch.get(ep, {}).get('eval_loss', 0.0)), 4)
+            eval_acc = round(float(
+                eval_per_epoch.get(ep, {}).get('eval_accuracy', 0.0)), 4)
+            f.write(f'{ep};{train_loss};{train_acc};{eval_loss};{eval_acc}\n')
+
+    print(f"\nTraining statistics saved to {stats_file}")
+
+
 def finetune_model(train_texts, train_labels, val_texts, val_labels,
                    output_dir: str = OUTPUT_DIR, prompt_tuning: bool = False,
                    full_finetune: bool = False):
@@ -462,11 +556,22 @@ def finetune_model(train_texts, train_labels, val_texts, val_labels,
         include_system_prompt = True
         lr = LEARNING_RATE
 
+    # Determine suffix for the training stats CSV
+    if full_finetune:
+        suffix = "_full_finetuned"
+    elif prompt_tuning:
+        suffix = "_prompt_tuned"
+    else:
+        suffix = "_finetuned"
+
     # Prepare datasets
     train_dataset = prepare_dataset(train_texts, train_labels, tokenizer,
                                     include_system_prompt=include_system_prompt)
     val_dataset = prepare_dataset(val_texts, val_labels, tokenizer,
                                   include_system_prompt=include_system_prompt)
+
+    # Callback that evaluates on the training set at each epoch end
+    epoch_callback = _EpochTrainEvalCallback()
 
     # Training arguments
     training_args = TrainingArguments(
@@ -478,9 +583,8 @@ def finetune_model(train_texts, train_labels, val_texts, val_labels,
         learning_rate=lr,
         warmup_steps=WARMUP_STEPS,
         logging_steps=10,
-        eval_strategy="steps",
-        eval_steps=100,
-        save_steps=100,
+        eval_strategy="epoch",
+        save_strategy="epoch",
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
@@ -506,11 +610,18 @@ def finetune_model(train_texts, train_labels, val_texts, val_labels,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
+        compute_metrics=_compute_token_accuracy,
+        preprocess_logits_for_metrics=_preprocess_logits_for_metrics,
+        callbacks=[epoch_callback],
     )
+    epoch_callback.set_trainer(trainer)
 
     # Train
     print("\nStarting training...")
     trainer.train()
+
+    # Save training statistics to CSV
+    _save_training_stats(trainer, epoch_callback, suffix)
 
     # Save the model (PEFT adapter)
     print(f"\nSaving finetuned model to {output_dir}...")
@@ -646,7 +757,7 @@ def predict_single(text: str, tokenizer, model, prompt_tuning: bool = False) -> 
     return 0  # Default to 0 if no clear label
 
 
-def evaluate_model(test_texts, test_labels, test_categories,
+def evaluate_model(test_texts, test_labels, test_sheet_names,
                    model_path: str = OUTPUT_DIR,
                    show_all_queries: bool = False,
                    prompt_tuning: bool = False,
@@ -659,6 +770,10 @@ def evaluate_model(test_texts, test_labels, test_categories,
       - full_finetune=True:  fully fine-tuned model (all parameters)
       - prompt_tuning=True:  prompt-tuned PEFT adapter
       - default (LoRA):      fine-tuned LoRA adapter
+
+    The per-sheet CSV report uses the same format as process.py:
+    semicolon-separated, columns sheet_name;n;lp;ln;pp;pn;tp;fp;tn;fn;
+    accuracy;precision;recall;f1, with a TOTAL row at the end.
     """
     print("\n" + "="*80)
     if original:
@@ -724,58 +839,59 @@ def evaluate_model(test_texts, test_labels, test_categories,
     print(f"  TN: {cm[0,0]}  FP: {cm[0,1]}")
     print(f"  FN: {cm[1,0]}  TP: {cm[1,1]}")
 
-    # Per-category statistics
+    # Per-sheet statistics (same structure as process.py)
     print("\n" + "="*80)
-    print("PER-CATEGORY STATISTICS")
+    print("PER-SHEET STATISTICS")
     print("="*80)
 
-    category_stats = []
-    for category_name in sorted(np.unique(test_categories)):
-        mask = test_categories == category_name
+    # Preserve original sheet order from the test file
+    seen = set()
+    unique_sheets = []
+    for s in test_sheet_names:
+        if s not in seen:
+            seen.add(s)
+            unique_sheets.append(s)
+
+    sheet_metrics = []
+    for sheet_name in unique_sheets:
+        mask = test_sheet_names == sheet_name
 
         if mask.sum() == 0:
             continue
 
-        category_labels = test_labels[mask]
-        category_preds = predictions[mask]
+        sheet_labels = test_labels[mask]
+        sheet_preds = predictions[mask]
 
-        n_samples = mask.sum()
-        n_label_0 = (category_labels == 0).sum()
-        n_label_1 = (category_labels == 1).sum()
+        n = int(mask.sum())
+        lp = int((sheet_labels == 1).sum())   # labeled positives
+        ln = int((sheet_labels == 0).sum())   # labeled negatives
+        pp = int((sheet_preds == 1).sum())    # predicted positives
+        pn = int((sheet_preds == 0).sum())    # predicted negatives
 
-        acc = accuracy_score(category_labels, category_preds)
-        prec, rec, f1_s, _ = precision_recall_fscore_support(
-            category_labels, category_preds, average='binary', zero_division=0
-        )
-        cm_category = confusion_matrix(category_labels, category_preds, labels=[0, 1])
+        cm_sheet = confusion_matrix(sheet_labels, sheet_preds, labels=[0, 1])
+        tp = int(cm_sheet[1, 1])
+        tn = int(cm_sheet[0, 0])
+        fp = int(cm_sheet[0, 1])
+        fn = int(cm_sheet[1, 0])
 
-        tp = cm_category[1,1]
-        tn = cm_category[0,0]
-        fp = cm_category[0,1]
-        fn = cm_category[1,0]
+        acc = round((tp + tn) / n, 3) if n > 0 else 0.0
+        prec = round(tp / pp, 3) if pp > 0 else 0.0
+        rec = round(tp / lp, 3) if lp > 0 else 0.0
+        f1_s = round(2 * prec * rec / (prec + rec), 3) if (prec + rec) > 0 else 0.0
 
-        print(f"\n{category_name.upper()}:")
-        print(f"  Samples: {n_samples} (Label 0: {n_label_0}, Label 1: {n_label_1})")
-        print(f"  Accuracy: {acc:.4f} ({acc*100:.1f}%) | Precision: {prec:.4f} | Recall: {rec:.4f} | F1: {f1_s:.4f}")
+        print(f"\n{sheet_name}:")
+        print(f"  n={n}  lp={lp}  ln={ln}  pp={pp}  pn={pn}")
+        print(f"  Accuracy: {acc}  Precision: {prec}  Recall: {rec}  F1: {f1_s}")
         print(f"  TP: {tp} | TN: {tn} | FP: {fp} | FN: {fn}")
 
-        category_stats.append({
-            'category': category_name,
-            'n_samples': n_samples,
-            'n_label_0': n_label_0,
-            'n_label_1': n_label_1,
-            'accuracy': acc,
-            'precision': prec,
-            'recall': rec,
-            'f1_score': f1_s,
-            'true_positives': tp,
-            'true_negatives': tn,
-            'false_positives': fp,
-            'false_negatives': fn
+        sheet_metrics.append({
+            'sheet_name': sheet_name,
+            'n': n, 'lp': lp, 'ln': ln, 'pp': pp, 'pn': pn,
+            'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn,
+            'accuracy': acc, 'precision': prec, 'recall': rec, 'f1': f1_s,
         })
 
-    # Save statistics
-    stats_df = pd.DataFrame(category_stats)
+    # Write semicolon-separated CSV identical to process.py
     if original:
         suffix = "_original"
     elif full_finetune:
@@ -785,16 +901,46 @@ def evaluate_model(test_texts, test_labels, test_categories,
     else:
         suffix = "_finetuned"
     stats_file = f'mamaylm{suffix}_statistics.csv'
-    stats_df.to_csv(stats_file, index=False)
-    print(f"\n\nPer-category statistics saved to {stats_file}")
+
+    with open(stats_file, 'w', encoding='utf-8') as f:
+        header = "sheet_name;n;lp;ln;pp;pn;tp;fp;tn;fn;accuracy;precision;recall;f1\n"
+        f.write(header)
+
+        total = {'n': 0, 'lp': 0, 'ln': 0, 'pp': 0, 'pn': 0,
+                 'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0}
+
+        for m in sheet_metrics:
+            line = (
+                f"{m['sheet_name']};{m['n']};{m['lp']};{m['ln']};"
+                f"{m['pp']};{m['pn']};{m['tp']};{m['fp']};"
+                f"{m['tn']};{m['fn']};{m['accuracy']};{m['precision']};{m['recall']};{m['f1']}\n"
+            )
+            f.write(line)
+            for k in total:
+                total[k] += m[k]
+
+        # TOTAL row
+        t_acc = round((total['tp'] + total['tn']) / total['n'], 3) if total['n'] > 0 else 0.0
+        t_prec = round(total['tp'] / total['pp'], 3) if total['pp'] > 0 else 0.0
+        t_rec = round(total['tp'] / total['lp'], 3) if total['lp'] > 0 else 0.0
+        t_f1 = round(2 * t_prec * t_rec / (t_prec + t_rec), 3) if (t_prec + t_rec) > 0 else 0.0
+
+        total_line = (
+            f"TOTAL;{total['n']};{total['lp']};{total['ln']};"
+            f"{total['pp']};{total['pn']};{total['tp']};{total['fp']};"
+            f"{total['tn']};{total['fn']};{t_acc};{t_prec};{t_rec};{t_f1}\n"
+        )
+        f.write(total_line)
+
+    print(f"\nPer-sheet statistics saved to {stats_file}")
 
     print("\n" + "="*80)
     print("SUMMARY")
     print("="*80)
-    print(f"Average Accuracy: {stats_df['accuracy'].mean():.4f}")
-    print(f"Average F1 Score: {stats_df['f1_score'].mean():.4f}")
-    print(f"Average Precision: {stats_df['precision'].mean():.4f}")
-    print(f"Average Recall: {stats_df['recall'].mean():.4f}")
+    print(f"Total Accuracy:  {t_acc}")
+    print(f"Total Precision: {t_prec}")
+    print(f"Total Recall:    {t_rec}")
+    print(f"Total F1:        {t_f1}")
     print("="*80)
 
     # Clean up
@@ -941,8 +1087,8 @@ def main():
 
     # Evaluate model if requested or if eval-only — test data loaded only when needed
     if args.evaluate or args.eval_only:
-        test_texts, test_labels, test_categories = load_test_data(args.test_data)
-        evaluate_model(test_texts, test_labels, test_categories,
+        test_texts, test_labels, test_sheet_names = load_test_data(args.test_data)
+        evaluate_model(test_texts, test_labels, test_sheet_names,
                        args.model_path, args.show_all_queries,
                        prompt_tuning=args.prompt_tuning,
                        original=args.original,
