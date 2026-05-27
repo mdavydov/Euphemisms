@@ -2,32 +2,35 @@
 """
 Finetune MamayLM model using data from all sheets and optionally evaluate it.
 
-Supports two finetuning modes:
-  1. LoRA (default) – finetunes low-rank adapters on attention/MLP weights
-  2. Prompt tuning (--prompt-tuning) – finetunes only the system-prompt
-     embeddings while keeping all network weights frozen
+Supports three finetuning modes (one is required):
+  --lora          – finetunes low-rank adapters on attention/MLP weights
+  --prompt-tuning – finetunes only the system-prompt embeddings; all weights frozen
+  --full-finetune – updates all model parameters, no PEFT
 
-Evaluation supports three model sources:
-  1. Fine-tuned LoRA model (default)
-  2. Prompt-tuned model (--prompt-tuning)
-  3. Original base model (--original) – no fine-tuning applied
+Evaluation model sources:
+  --lora          – load fine-tuned LoRA model
+  --prompt-tuning – load prompt-tuned PEFT adapter
+  --full-finetune – load fully fine-tuned model
+  --original      – load original base model (no fine-tuning; skips mode requirement)
 
 This script:
 1. Loads training data from PETs_Ukr_Train.xlsx (split 80/20 into train/validation)
    only when finetuning (skipped in --eval-only mode)
 2. Loads test data from PETs_Ukr_Test.xlsx only when evaluating
-3. Finetunes MamayLM using LoRA/PEFT or prompt tuning with validation tracking
+3. Finetunes MamayLM using the chosen method with validation tracking
 4. Saves the finetuned model
 5. Optionally evaluates the model on the test set
 
 Usage:
-    python finetune_mamaylm.py                                    # LoRA finetune
-    python finetune_mamaylm.py --prompt-tuning                    # Prompt-tuning finetune
-    python finetune_mamaylm.py --evaluate                         # Finetune and evaluate
-    python finetune_mamaylm.py --eval-only                        # Evaluate fine-tuned model
+    python finetune_mamaylm.py --lora                             # LoRA fine-tune
+    python finetune_mamaylm.py --prompt-tuning                    # Prompt-tuning fine-tune
+    python finetune_mamaylm.py --full-finetune                    # Full fine-tuning (all params)
+    python finetune_mamaylm.py --lora --evaluate                  # Fine-tune and evaluate
+    python finetune_mamaylm.py --lora --eval-only                 # Evaluate fine-tuned LoRA model
     python finetune_mamaylm.py --eval-only --original             # Evaluate original base model
+    python finetune_mamaylm.py --full-finetune --eval-only        # Evaluate fully fine-tuned model
     python finetune_mamaylm.py --prompt-tuning --eval-only        # Evaluate prompt-tuned model
-    python finetune_mamaylm.py --predict "Text with <word>" --model-path ./path
+    python finetune_mamaylm.py --lora --predict "Text with <word>" --model-path ./path
 """
 
 import argparse
@@ -60,6 +63,7 @@ from config import SYSTEM_PROMPT
 MODEL_NAME = "INSAIT-Institute/MamayLM-Gemma-3-12B-IT-v1.0"
 OUTPUT_DIR = "./mamaylm_finetuned"
 PROMPT_TUNING_OUTPUT_DIR = "./mamaylm_prompt_tuned"
+FULL_FINETUNE_OUTPUT_DIR = "./mamaylm_full_finetuned"
 LORA_RANK = 8
 LORA_ALPHA = 16
 LORA_DROPOUT = 0.1
@@ -68,6 +72,7 @@ BATCH_SIZE = 1
 GRADIENT_ACCUMULATION_STEPS = 8
 LEARNING_RATE = 2e-4
 PROMPT_TUNING_LEARNING_RATE = 3e-2  # Higher LR typical for prompt tuning
+FULL_FINETUNE_LEARNING_RATE = 2e-5  # Lower LR for full fine-tuning
 NUM_EPOCHS = 3
 WARMUP_STEPS = 100
 
@@ -424,9 +429,15 @@ def extract_and_save_prompt_embeddings(model, output_path: str):
 
 
 def finetune_model(train_texts, train_labels, val_texts, val_labels,
-                   output_dir: str = OUTPUT_DIR, prompt_tuning: bool = False):
-    """Finetune MamayLM using LoRA (default) or prompt tuning."""
-    mode_label = "PROMPT TUNING" if prompt_tuning else "LoRA"
+                   output_dir: str = OUTPUT_DIR, prompt_tuning: bool = False,
+                   full_finetune: bool = False):
+    """Finetune MamayLM using LoRA (default), prompt tuning, or full fine-tuning."""
+    if full_finetune:
+        mode_label = "FULL FINE-TUNING"
+    elif prompt_tuning:
+        mode_label = "PROMPT TUNING"
+    else:
+        mode_label = "LoRA"
     print("\n" + "="*80)
     print(f"STARTING FINETUNING ({mode_label})")
     print("="*80)
@@ -434,8 +445,14 @@ def finetune_model(train_texts, train_labels, val_texts, val_labels,
     # Load model and tokenizer
     tokenizer, model = load_base_model(MODEL_NAME)
 
-    # Apply the chosen parameter-efficient method
-    if prompt_tuning:
+    # Apply the chosen training method
+    if full_finetune:
+        # No PEFT – all parameters are updated; gradient checkpointing saves memory
+        include_system_prompt = True
+        lr = FULL_FINETUNE_LEARNING_RATE
+        model.gradient_checkpointing_enable()
+        print(f"Full fine-tuning: all {sum(p.numel() for p in model.parameters()):,} parameters trainable")
+    elif prompt_tuning:
         model, num_virtual_tokens = setup_prompt_tuning(model, tokenizer)
         patch_peft_forward_for_gemma3(model, num_virtual_tokens)
         include_system_prompt = False  # learned embeddings replace system prompt
@@ -471,7 +488,7 @@ def finetune_model(train_texts, train_labels, val_texts, val_labels,
         optim="adamw_torch",
         remove_unused_columns=False,
         report_to="none",
-        gradient_checkpointing=False,
+        gradient_checkpointing=full_finetune,
         max_grad_norm=1.0,
         dataloader_pin_memory=False,
     )
@@ -581,6 +598,25 @@ def load_original_model():
     return tokenizer, model
 
 
+def load_full_finetuned_model(model_path: str = FULL_FINETUNE_OUTPUT_DIR):
+    """Load a fully fine-tuned model (all parameters updated, no PEFT adapters)."""
+    print(f"Loading fully fine-tuned model from {model_path}...")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map="cuda:0",
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    )
+
+    print("Fully fine-tuned model loaded successfully!")
+    return tokenizer, model
+
+
 def predict_single(text: str, tokenizer, model, prompt_tuning: bool = False) -> int:
     """Make a prediction for a single text with memory optimization."""
     prompt = format_prompt(text, include_system_prompt=not prompt_tuning)
@@ -614,17 +650,21 @@ def evaluate_model(test_texts, test_labels, test_categories,
                    model_path: str = OUTPUT_DIR,
                    show_all_queries: bool = False,
                    prompt_tuning: bool = False,
-                   original: bool = False):
+                   original: bool = False,
+                   full_finetune: bool = False):
     """Evaluate a model on the test set.
 
-    Three model sources are supported:
-      - original=True:      base MamayLM without any fine-tuning
-      - prompt_tuning=True: prompt-tuned PEFT adapter
-      - default (LoRA):     fine-tuned LoRA adapter
+    Four model sources are supported:
+      - original=True:       base MamayLM without any fine-tuning
+      - full_finetune=True:  fully fine-tuned model (all parameters)
+      - prompt_tuning=True:  prompt-tuned PEFT adapter
+      - default (LoRA):      fine-tuned LoRA adapter
     """
     print("\n" + "="*80)
     if original:
         mode_label = "ORIGINAL (BASE)"
+    elif full_finetune:
+        mode_label = "FULLY FINE-TUNED"
     elif prompt_tuning:
         mode_label = "PROMPT-TUNED"
     else:
@@ -635,6 +675,8 @@ def evaluate_model(test_texts, test_labels, test_categories,
     # Load the appropriate model
     if original:
         tokenizer, model = load_original_model()
+    elif full_finetune:
+        tokenizer, model = load_full_finetuned_model(model_path)
     elif prompt_tuning:
         tokenizer, model = load_prompt_tuned_model(model_path)
     else:
@@ -736,6 +778,8 @@ def evaluate_model(test_texts, test_labels, test_categories,
     stats_df = pd.DataFrame(category_stats)
     if original:
         suffix = "_original"
+    elif full_finetune:
+        suffix = "_full_finetuned"
     elif prompt_tuning:
         suffix = "_prompt_tuned"
     else:
@@ -763,11 +807,23 @@ def main():
     parser = argparse.ArgumentParser(
         description="Finetune MamayLM using half of the data with optional evaluation"
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        '--lora',
+        action='store_true',
+        help='Fine-tune using LoRA: update low-rank adapters on attention/MLP weights'
+    )
+    mode_group.add_argument(
         '--prompt-tuning',
         action='store_true',
-        help='Use prompt tuning instead of LoRA: optimise only the system-prompt '
+        help='Fine-tune using prompt tuning: optimise only the system-prompt '
              'embeddings while keeping all network weights frozen'
+    )
+    mode_group.add_argument(
+        '--full-finetune',
+        action='store_true',
+        help='Full fine-tuning: update all model parameters (no PEFT adapters). '
+             'Much higher memory requirements than LoRA or prompt tuning.'
     )
     parser.add_argument(
         '--evaluate',
@@ -817,9 +873,19 @@ def main():
 
     args = parser.parse_args()
 
+    # Require a fine-tune mode unless evaluating the original base model
+    if not any([args.lora, args.prompt_tuning, args.full_finetune]) and not args.original:
+        parser.error("one of --lora, --prompt-tuning, --full-finetune is required "
+                     "(or --original to evaluate the base model without fine-tuning)")
+
     # Resolve default model path based on mode
     if args.model_path is None:
-        args.model_path = PROMPT_TUNING_OUTPUT_DIR if args.prompt_tuning else OUTPUT_DIR
+        if args.prompt_tuning:
+            args.model_path = PROMPT_TUNING_OUTPUT_DIR
+        elif args.full_finetune:
+            args.model_path = FULL_FINETUNE_OUTPUT_DIR
+        else:
+            args.model_path = OUTPUT_DIR
 
     # Single phrase prediction mode
     if args.predict:
@@ -828,12 +894,24 @@ def main():
         print("="*80)
         print(f"Text: {args.predict}")
         print(f"Model: {args.model_path}")
-        print(f"Mode: {'prompt tuning' if args.prompt_tuning else 'LoRA'}")
+        if args.original:
+            mode = "original base"
+        elif args.full_finetune:
+            mode = "full fine-tune"
+        elif args.prompt_tuning:
+            mode = "prompt tuning"
+        else:
+            mode = "LoRA"
+        print(f"Mode: {mode}")
         print()
 
         # Load model
-        if args.prompt_tuning:
+        if args.original:
+            tokenizer, model = load_original_model()
+        elif args.prompt_tuning:
             tokenizer, model = load_prompt_tuned_model(args.model_path)
+        elif args.full_finetune:
+            tokenizer, model = load_full_finetuned_model(args.model_path)
         else:
             tokenizer, model = load_finetuned_model(args.model_path)
         model.eval()
@@ -856,7 +934,8 @@ def main():
     if not args.eval_only:
         train_texts, train_labels, val_texts, val_labels = load_train_val_data(args.train_data)
         finetune_model(train_texts, train_labels, val_texts, val_labels,
-                       args.model_path, prompt_tuning=args.prompt_tuning)
+                       args.model_path, prompt_tuning=args.prompt_tuning,
+                       full_finetune=args.full_finetune)
     else:
         print("Skipping finetuning (--eval-only mode)")
 
@@ -866,7 +945,8 @@ def main():
         evaluate_model(test_texts, test_labels, test_categories,
                        args.model_path, args.show_all_queries,
                        prompt_tuning=args.prompt_tuning,
-                       original=args.original)
+                       original=args.original,
+                       full_finetune=args.full_finetune)
     else:
         print("\nSkipping evaluation. Use --evaluate flag to evaluate the model.")
         print(f"To evaluate later, run: python {__file__} --eval-only")
