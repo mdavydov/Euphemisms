@@ -31,6 +31,8 @@ Usage:
     python finetune_mamaylm.py --full-finetune --eval-only        # Evaluate fully fine-tuned model
     python finetune_mamaylm.py --prompt-tuning --eval-only        # Evaluate prompt-tuned model
     python finetune_mamaylm.py --lora --predict "Text with <word>" --model-path ./path
+    python finetune_mamaylm.py --lora --iterations 3              # 3 iterations, saves finetune-01..03
+    python finetune_mamaylm.py --lora --iterations 2 --resume-from finetune-03  # continue from iter 3
 """
 
 import argparse
@@ -57,6 +59,7 @@ from peft import (
     get_peft_model,
     PeftModel,
     TaskType,
+    prepare_model_for_kbit_training,
 )
 from datasets import Dataset
 from config import SYSTEM_PROMPT
@@ -285,7 +288,6 @@ def setup_lora(model):
     """Set up LoRA configuration for efficient finetuning."""
     print("Setting up LoRA...")
 
-    from peft import prepare_model_for_kbit_training
     model = prepare_model_for_kbit_training(model)
 
     lora_config = LoraConfig(
@@ -478,7 +480,7 @@ class _EpochTrainEvalCallback(TrainerCallback):
         self.train_metrics_per_epoch.append({'epoch': epoch, **metrics})
 
 
-def _save_training_stats(trainer, epoch_callback, suffix):
+def _save_training_stats(trainer, epoch_callback, suffix, output_dir='.'):
     """Extract per-epoch statistics from the trainer log history and the
     epoch callback, then write a semicolon-separated CSV.
 
@@ -506,7 +508,7 @@ def _save_training_stats(trainer, epoch_callback, suffix):
 
     all_epochs = sorted(set(epoch_train_losses) | set(eval_per_epoch))
 
-    stats_file = f'mamaylm{suffix}_training_stats.csv'
+    stats_file = str(Path(output_dir) / f'mamaylm{suffix}_training_stats.csv')
     with open(stats_file, 'w', encoding='utf-8') as f:
         f.write('epoch;train_loss;train_accuracy;eval_loss;eval_accuracy\n')
         for ep in all_epochs:
@@ -524,8 +526,16 @@ def _save_training_stats(trainer, epoch_callback, suffix):
 
 def finetune_model(train_texts, train_labels, val_texts, val_labels,
                    output_dir: str = OUTPUT_DIR, prompt_tuning: bool = False,
-                   full_finetune: bool = False):
-    """Finetune MamayLM using LoRA (default), prompt tuning, or full fine-tuning."""
+                   full_finetune: bool = False, resume_from: str = None,
+                   iterations: int = None):
+    """Finetune MamayLM using LoRA (default), prompt tuning, or full fine-tuning.
+
+    When *iterations* is given, trains one epoch per iteration and saves
+    weights after each to finetune-01/, finetune-02/, etc.  *resume_from*
+    loads weights from a previous iteration folder so training can continue.
+
+    Returns the path to the last saved model directory.
+    """
     if full_finetune:
         mode_label = "FULL FINE-TUNING"
     elif prompt_tuning:
@@ -539,22 +549,44 @@ def finetune_model(train_texts, train_labels, val_texts, val_labels,
     # Load model and tokenizer
     tokenizer, model = load_base_model(MODEL_NAME)
 
-    # Apply the chosen training method
+    # Apply the chosen training method (with optional resume from checkpoint)
     if full_finetune:
-        # No PEFT – all parameters are updated; gradient checkpointing saves memory
         include_system_prompt = True
         lr = FULL_FINETUNE_LEARNING_RATE
+        if resume_from:
+            print(f"Resuming full fine-tune from: {resume_from}")
+            del model
+            torch.cuda.empty_cache()
+            gc.collect()
+            tokenizer = AutoTokenizer.from_pretrained(resume_from)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            model = AutoModelForCausalLM.from_pretrained(
+                resume_from, device_map="cuda:0",
+                torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
         model.gradient_checkpointing_enable()
         print(f"Full fine-tuning: all {sum(p.numel() for p in model.parameters()):,} parameters trainable")
     elif prompt_tuning:
-        model, num_virtual_tokens = setup_prompt_tuning(model, tokenizer)
-        patch_peft_forward_for_gemma3(model, num_virtual_tokens)
         include_system_prompt = False  # learned embeddings replace system prompt
         lr = PROMPT_TUNING_LEARNING_RATE
+        if resume_from:
+            print(f"Resuming prompt-tuning from: {resume_from}")
+            model = PeftModel.from_pretrained(model, resume_from, is_trainable=True)
+            nvt = model.peft_config["default"].num_virtual_tokens
+            patch_peft_forward_for_gemma3(model, nvt)
+        else:
+            model, num_virtual_tokens = setup_prompt_tuning(model, tokenizer)
+            patch_peft_forward_for_gemma3(model, num_virtual_tokens)
     else:
-        model = setup_lora(model)
         include_system_prompt = True
         lr = LEARNING_RATE
+        if resume_from:
+            print(f"Resuming LoRA from: {resume_from}")
+            model = prepare_model_for_kbit_training(model)
+            model = PeftModel.from_pretrained(model, resume_from, is_trainable=True)
+            model.print_trainable_parameters()
+        else:
+            model = setup_lora(model)
 
     # Determine suffix for the training stats CSV
     if full_finetune:
@@ -570,71 +602,147 @@ def finetune_model(train_texts, train_labels, val_texts, val_labels,
     val_dataset = prepare_dataset(val_texts, val_labels, tokenizer,
                                   include_system_prompt=include_system_prompt)
 
-    # Callback that evaluates on the training set at each epoch end
-    epoch_callback = _EpochTrainEvalCallback()
+    if iterations is not None:
+        # ── Iterative training: one epoch per iteration ──────────────
+        # Determine starting iteration from resume folder name
+        start_iter = 0
+        if resume_from:
+            try:
+                start_iter = int(Path(resume_from).name.split('-')[-1])
+            except (ValueError, IndexError):
+                pass
+            print(f"Continuing from iteration {start_iter}")
 
-    # Training arguments
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        num_train_epochs=NUM_EPOCHS,
-        per_device_train_batch_size=BATCH_SIZE,
-        per_device_eval_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-        learning_rate=lr,
-        warmup_steps=WARMUP_STEPS,
-        logging_steps=10,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        save_total_limit=2,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        bf16=True,
-        optim="adamw_torch",
-        remove_unused_columns=False,
-        report_to="none",
-        gradient_checkpointing=full_finetune,
-        max_grad_norm=1.0,
-        dataloader_pin_memory=False,
-    )
+        last_output = None
+        for i in range(1, iterations + 1):
+            iter_num = start_iter + i
+            iter_dir = f"finetune-{iter_num:02d}"
+            Path(iter_dir).mkdir(exist_ok=True)
 
-    # Data collator
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False
-    )
+            print(f"\n{'─'*80}")
+            print(f"ITERATION {i}/{iterations}  (cumulative epoch {iter_num})")
+            print(f"Output: {iter_dir}")
+            print(f"{'─'*80}")
 
-    # Create trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=data_collator,
-        compute_metrics=_compute_token_accuracy,
-        preprocess_logits_for_metrics=_preprocess_logits_for_metrics,
-        callbacks=[epoch_callback],
-    )
-    epoch_callback.set_trainer(trainer)
+            epoch_callback = _EpochTrainEvalCallback()
 
-    # Train
-    print("\nStarting training...")
-    trainer.train()
+            training_args = TrainingArguments(
+                output_dir=iter_dir,
+                num_train_epochs=1,
+                per_device_train_batch_size=BATCH_SIZE,
+                per_device_eval_batch_size=BATCH_SIZE,
+                gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+                learning_rate=lr,
+                warmup_steps=WARMUP_STEPS if (i == 1 and not resume_from) else 0,
+                logging_steps=10,
+                eval_strategy="epoch",
+                save_strategy="no",
+                bf16=True,
+                optim="adamw_torch",
+                remove_unused_columns=False,
+                report_to="none",
+                gradient_checkpointing=full_finetune,
+                max_grad_norm=1.0,
+                dataloader_pin_memory=False,
+            )
 
-    # Save training statistics to CSV
-    _save_training_stats(trainer, epoch_callback, suffix)
+            data_collator = DataCollatorForLanguageModeling(
+                tokenizer=tokenizer, mlm=False)
 
-    # Save the model (PEFT adapter)
-    print(f"\nSaving finetuned model to {output_dir}...")
-    trainer.save_model(output_dir)
-    tokenizer.save_pretrained(output_dir)
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=train_dataset,
+                eval_dataset=val_dataset,
+                data_collator=data_collator,
+                compute_metrics=_compute_token_accuracy,
+                preprocess_logits_for_metrics=_preprocess_logits_for_metrics,
+                callbacks=[epoch_callback],
+            )
+            epoch_callback.set_trainer(trainer)
 
-    # For prompt tuning, also save the raw prompt embeddings as a .pt file
-    if prompt_tuning:
-        pt_path = str(Path(output_dir) / "prompt_embeddings.pt")
-        extract_and_save_prompt_embeddings(trainer.model, pt_path)
+            print(f"\nTraining iteration {i}...")
+            trainer.train()
+
+            # Save training statistics
+            _save_training_stats(trainer, epoch_callback, suffix, iter_dir)
+
+            # Save model
+            print(f"Saving model to {iter_dir}...")
+            trainer.save_model(iter_dir)
+            tokenizer.save_pretrained(iter_dir)
+
+            if prompt_tuning:
+                pt_path = str(Path(iter_dir) / "prompt_embeddings.pt")
+                extract_and_save_prompt_embeddings(trainer.model, pt_path)
+
+            # Keep model for next iteration, free trainer
+            model = trainer.model
+            del trainer, epoch_callback
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            last_output = iter_dir
+            print(f"Iteration {i}/{iterations} complete -> {iter_dir}")
+    else:
+        # ── Original single-run training ─────────────────────────────
+        epoch_callback = _EpochTrainEvalCallback()
+
+        training_args = TrainingArguments(
+            output_dir=output_dir,
+            num_train_epochs=NUM_EPOCHS,
+            per_device_train_batch_size=BATCH_SIZE,
+            per_device_eval_batch_size=BATCH_SIZE,
+            gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+            learning_rate=lr,
+            warmup_steps=WARMUP_STEPS,
+            logging_steps=10,
+            eval_strategy="epoch",
+            save_strategy="epoch",
+            save_total_limit=2,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            bf16=True,
+            optim="adamw_torch",
+            remove_unused_columns=False,
+            report_to="none",
+            gradient_checkpointing=full_finetune,
+            max_grad_norm=1.0,
+            dataloader_pin_memory=False,
+        )
+
+        data_collator = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer, mlm=False)
+
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            data_collator=data_collator,
+            compute_metrics=_compute_token_accuracy,
+            preprocess_logits_for_metrics=_preprocess_logits_for_metrics,
+            callbacks=[epoch_callback],
+        )
+        epoch_callback.set_trainer(trainer)
+
+        print("\nStarting training...")
+        trainer.train()
+
+        _save_training_stats(trainer, epoch_callback, suffix)
+
+        print(f"\nSaving finetuned model to {output_dir}...")
+        trainer.save_model(output_dir)
+        tokenizer.save_pretrained(output_dir)
+
+        if prompt_tuning:
+            pt_path = str(Path(output_dir) / "prompt_embeddings.pt")
+            extract_and_save_prompt_embeddings(trainer.model, pt_path)
+
+        del trainer
+        last_output = output_dir
 
     # Clean up training resources
-    del trainer
     del model
     del train_dataset
     del val_dataset
@@ -643,6 +751,7 @@ def finetune_model(train_texts, train_labels, val_texts, val_labels,
 
     print("Finetuning complete!")
     print("="*80)
+    return last_output
 
 
 def load_finetuned_model(model_path: str = OUTPUT_DIR):
@@ -1016,8 +1125,30 @@ def main():
         default=None,
         help='Predict classification for a single phrase (e.g., "Text with <word> in brackets")'
     )
+    parser.add_argument(
+        '--iterations',
+        type=int,
+        default=None,
+        help='Number of training iterations (1 epoch each). '
+             'Saves weights after each iteration to finetune-01/, finetune-02/, etc.'
+    )
+    parser.add_argument(
+        '--resume-from',
+        type=str,
+        default=None,
+        help='Resume training from a previous iteration folder (e.g. finetune-03). '
+             'Iteration numbering continues from the given checkpoint.'
+    )
 
     args = parser.parse_args()
+
+    # If --resume-from is given without --iterations, default to 1 iteration
+    if args.resume_from and args.iterations is None:
+        args.iterations = 1
+
+    # Validate --resume-from path exists
+    if args.resume_from and not Path(args.resume_from).is_dir():
+        parser.error(f"--resume-from path does not exist: {args.resume_from}")
 
     # Require a fine-tune mode unless evaluating the original base model
     if not any([args.lora, args.prompt_tuning, args.full_finetune]) and not args.original:
@@ -1079,9 +1210,14 @@ def main():
     # Finetune model (unless eval-only) — train/val data loaded only when needed
     if not args.eval_only:
         train_texts, train_labels, val_texts, val_labels = load_train_val_data(args.train_data)
-        finetune_model(train_texts, train_labels, val_texts, val_labels,
+        last_dir = finetune_model(train_texts, train_labels, val_texts, val_labels,
                        args.model_path, prompt_tuning=args.prompt_tuning,
-                       full_finetune=args.full_finetune)
+                       full_finetune=args.full_finetune,
+                       resume_from=args.resume_from,
+                       iterations=args.iterations)
+        # Point model_path to the last saved directory for subsequent evaluation
+        if last_dir:
+            args.model_path = last_dir
     else:
         print("Skipping finetuning (--eval-only mode)")
 
