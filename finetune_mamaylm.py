@@ -280,6 +280,12 @@ def load_base_model(model_name: str):
             low_cpu_mem_usage=True,
         )
 
+    # Disable KV-caching for training/eval forward passes: with teacher-forced
+    # full-sequence inputs the cache isn't used, and leaving it enabled makes
+    # Gemma3 return a DynamicCache object in the output tuple, which crashes
+    # Trainer's cross-process padding/gathering during evaluation.
+    model.config.use_cache = False
+
     print("Base model loaded successfully!")
     return tokenizer, model
 
@@ -475,7 +481,8 @@ class _EpochTrainEvalCallback(TrainerCallback):
         epoch = int(state.epoch)
         print(f"\n  Evaluating on training set (epoch {epoch})...")
         metrics = self._trainer.evaluate(
-            self._trainer.train_dataset, metric_key_prefix="train"
+            self._trainer.train_dataset, metric_key_prefix="train",
+            ignore_keys=["past_key_values"],
         )
         self.train_metrics_per_epoch.append({'epoch': epoch, **metrics})
 
@@ -564,6 +571,7 @@ def finetune_model(train_texts, train_labels, val_texts, val_labels,
             model = AutoModelForCausalLM.from_pretrained(
                 resume_from, device_map="cuda:0",
                 torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+            model.config.use_cache = False
         model.gradient_checkpointing_enable()
         print(f"Full fine-tuning: all {sum(p.numel() for p in model.parameters()):,} parameters trainable")
     elif prompt_tuning:
@@ -662,7 +670,7 @@ def finetune_model(train_texts, train_labels, val_texts, val_labels,
             epoch_callback.set_trainer(trainer)
 
             print(f"\nTraining iteration {i}...")
-            trainer.train()
+            trainer.train(ignore_keys_for_eval=["past_key_values"])
 
             # Save training statistics
             _save_training_stats(trainer, epoch_callback, suffix, iter_dir)
@@ -727,7 +735,7 @@ def finetune_model(train_texts, train_labels, val_texts, val_labels,
         epoch_callback.set_trainer(trainer)
 
         print("\nStarting training...")
-        trainer.train()
+        trainer.train(ignore_keys_for_eval=["past_key_values"])
 
         _save_training_stats(trainer, epoch_callback, suffix)
 
